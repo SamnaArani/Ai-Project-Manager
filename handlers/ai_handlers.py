@@ -112,35 +112,29 @@ async def execute_plan(plan: Dict[str, Any], user_input: str, update: Update, co
     return True
 
 def log_chat(user_id: str, user_name: str, user_message: str, bot_response: str, success: bool, error_message: str = None):
-    """مکالمه‌ها (به‌خصوص شکست‌ها) رو توی Appwrite ذخیره می‌کنه."""
-    # بررسی وجود متغیرهای پیکربندی
-    if not hasattr(config, 'APPWRITE_CHAT_DATABASE_ID') or not config.APPWRITE_CHAT_DATABASE_ID:
-        logger.error("APPWRITE_CHAT_DATABASE_ID تعریف نشده است")
-        return
-        
-    if not hasattr(config, 'CHAT_LOGS_COLLECTION_ID') or not config.CHAT_LOGS_COLLECTION_ID:
-        logger.error("CHAT_LOGS_COLLECTION_ID تعریف نشده است")
+    """مکالمه‌ها را در دیتابیس مخصوص چت‌ها ذخیره می‌کند."""
+    if not all([config.APPWRITE_CHAT_DATABASE_ID, config.CHAT_LOGS_COLLECTION_ID]):
+        logger.warning("شناسه‌های دیتابیس یا کالکشن چت در فایل config تعریف نشده‌اند. ذخیره‌سازی لاگ غیرفعال است.")
         return
     
     data = {
-        'user_id': user_id,
+        'user_id': str(user_id),
         'user_name': user_name,
         'user_message': user_message,
         'bot_response': bot_response,
         'success': success,
-        'error_message': error_message,
-        'timestamp': int(datetime.now().timestamp() * 1000)
+        'error_message': error_message or "",
+        'timestamp': datetime.now().isoformat() # استفاده از فرمت استاندارد تاریخ
     }
     
     try:
-        # استفاده از signature صحیح تابع upsert_document
-        database.upsert_document(
-            config.CHAT_LOGS_COLLECTION_ID,  # collection_id
-            'user_id',                       # query_key
-            user_id,                         # query_value
-            data                             # data
+        # استفاده از تابع جدید create_document برای درج مستقیم لاگ
+        database.create_document(
+            database_id=config.APPWRITE_CHAT_DATABASE_ID,
+            collection_id=config.CHAT_LOGS_COLLECTION_ID,
+            data=data
         )
-        logger.info(f"مکالمه برای کاربر {user_id} با موفقیت ذخیره شد.")
+        logger.info(f"مکالمه برای کاربر {user_id} با موفقیت در دیتابیس چت ذخیره شد.")
     except Exception as e:
         logger.error(f"خطا در ذخیره مکالمه در Appwrite: {e}", exc_info=True)
 
@@ -162,11 +156,10 @@ async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 task_id, task_name = pending_deletion_info['task_id'], pending_deletion_info['task_name']
                 await update.message.reply_text(f"در حال حذف تسک '{task_name}'...")
                 try:
+                    # اطمینان از اینکه حذف از دیتابیس اصلی انجام می‌شود
                     if await asyncio.to_thread(clickup_api.delete_task_in_clickup, task_id):
-                        if database.delete_document_by_clickup_id(config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, task_id):
-                            await update.message.reply_text(f"✅ تسک '{task_name}' با موفقیت حذف شد.")
-                        else:
-                            await update.message.reply_text("❌ حذف سند از دیتابیس ناموفق بود.")
+                        database.delete_document_by_clickup_id(config.TASKS_COLLECTION_ID, task_id)
+                        await update.message.reply_text(f"✅ تسک '{task_name}' با موفقیت حذف شد.")
                     else:
                         await update.message.reply_text("❌ حذف تسک از ClickUp ناموفق بود.")
                 except Exception as e:
@@ -186,7 +179,18 @@ async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     llm_router = ChatOllama(model=config.OLLAMA_MODEL, base_url=config.OLLAMA_BASE_URL, format="json", temperature=0)
     try:
         response = await llm_router.ainvoke(routing_messages)
-        plan = json.loads(response.content)
+        plan_content = response.content
+        plan = {}
+
+        try:
+            plan = json.loads(plan_content)
+            if not isinstance(plan, dict):
+                logger.warning(f"LLM plan did not parse to a dictionary: {plan}")
+                plan = {} # Fallback to no_op
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to decode LLM response as JSON: {plan_content}")
+            plan = {} # Fallback to no_op
+        
         tool_name = plan.get('steps', [{}])[0].get('tool_name', 'no_op')
         if tool_name not in tools.TOOL_MAPPING or tools.TOOL_MAPPING.get(tool_name) is None:
             tool_name = 'no_op'
@@ -202,24 +206,26 @@ async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_response = await llm_chat.ainvoke([SystemMessage(content=chat_prompt_text)] + history + [HumanMessage(content=user_input)])
             await update.message.reply_text(chat_response.content)
             memory.save_context({"input": user_input}, {"output": chat_response.content})
-            log_chat(user_id, user_name, user_input, chat_response.content, True)  # فعال کردن ذخیره‌سازی
+            log_chat(user_id, user_name, user_input, chat_response.content, True)
         else:
             logger.info(f"مسیریاب ابزار '{tool_name}' را انتخاب کرد. اجرای نقشه...")
             is_interactive = tool_name in ['ask_user', 'confirm_and_delete_task', 'create_task']
             success = await execute_plan(plan, user_input, update, context)
             if not is_interactive:
                 memory.save_context({"input": user_input}, {"output": response.content})
-                log_chat(user_id, user_name, user_input, response.content, success)  # فعال کردن ذخیره‌سازی
+                log_chat(user_id, user_name, user_input, response.content, success)
     
     except json.JSONDecodeError:
-        logger.error("پاسخ از LLM به فرمت JSON نیست.", exc_info=True)
+        error_msg = "پاسخ از LLM به فرمت JSON نیست."
+        logger.error(error_msg, exc_info=True)
         await update.message.reply_text("🚨 خطا: پاسخ نامعتبر از هوش مصنوعی دریافت شد.")
-        log_chat(user_id, user_name, user_input, "پاسخ نامعتبر", False, "JSONDecodeError")
+        log_chat(user_id, user_name, user_input, "", False, "JSONDecodeError: " + error_msg)
     except telegram.error.NetworkError as ne:
         logger.error(f"خطای شبکه در ارتباط با تلگرام: {ne}", exc_info=True)
         await update.message.reply_text("🚨 خطای شبکه: لطفاً اتصال اینترنت را بررسی کنید.")
-        log_chat(user_id, user_name, user_input, str(ne), False, str(ne))
+        log_chat(user_id, user_name, user_input, "", False, str(ne))
     except Exception as e:
         logger.critical(f"یک خطای غیرمنتظره در پردازش هوشمند رخ داد: {e}", exc_info=True)
-        await update.message.reply_text(f"🚨 یک خطای غیرمنتظره رخ داد: {str(e)}")
-        log_chat(user_id, user_name, user_input, str(e), False, str(e))
+        await update.message.reply_text(f"🚨 یک خطای غیرمنتžره رخ داد: {str(e)}")
+        log_chat(user_id, user_name, user_input, "", False, str(e))
+
