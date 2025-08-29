@@ -15,13 +15,14 @@ import config
 import database
 import clickup_api
 from ai import tools
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 (CREATE_SELECTING_LIST, CREATE_TYPING_TITLE, CREATE_TYPING_DESCRIPTION,
- CREATE_SELECTING_STATUS, CREATE_SELECTING_PRIORITY, CREATE_TYPING_DUE_DATE,
- CREATE_SELECTING_ASSIGNEE) = range(7)
-(EDIT_SELECTING_FIELD, EDIT_TYPING_VALUE, EDIT_SELECTING_VALUE) = range(7, 10)
+ CREATE_SELECTING_STATUS, CREATE_SELECTING_PRIORITY, CREATE_TYPING_START_DATE, 
+ CREATE_TYPING_DUE_DATE, CREATE_SELECTING_ASSIGNEE) = range(8)
+(EDIT_SELECTING_FIELD, EDIT_TYPING_VALUE, EDIT_SELECTING_VALUE) = range(8, 11)
 
 def parse_due_date(due_date_str: str) -> int | None:
     try:
@@ -49,9 +50,18 @@ async def browse_projects_entry(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("برای شروع مرور، روی دکمه زیر کلیک کنید:", reply_markup=reply_markup)
 
 async def render_task_view(query_or_update, task_id):
-    task = await asyncio.to_thread(database.get_single_document, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
-    target = query_or_update.message if isinstance(query_or_update, CallbackQuery) else query_or_update.effective_message
+    target_message = query_or_update.message if isinstance(query_or_update, CallbackQuery) else query_or_update
+    task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
+    
     if task:
+        start_date_str = "تعیین نشده"
+        if task.get('start_date'):
+            try:
+                dt_object = datetime.fromtimestamp(int(task['start_date']) / 1000)
+                start_date_str = dt_object.strftime('%Y-%m-%d')
+            except (ValueError, TypeError):
+                start_date_str = "نامشخص"
+
         due_date_str = "تعیین نشده"
         if task.get('due_date'):
             try:
@@ -62,6 +72,7 @@ async def render_task_view(query_or_update, task_id):
         text = (f"*{task.get('title', 'بدون عنوان')}*\n\n"
                 f"*وضعیت:* {task.get('status', 'N/A')}\n"
                 f"*اولویت:* {task.get('priority', 'N/A')}\n"
+                f"*تاریخ شروع:* {start_date_str}\n"
                 f"*تاریخ تحویل:* {due_date_str}\n\n"
                 f"*توضیحات:*\n{task.get('content', 'توضیحاتی وجود ندارد.')}")
         keyboard = [
@@ -71,9 +82,9 @@ async def render_task_view(query_or_update, task_id):
             keyboard.append([InlineKeyboardButton("↩️ بازگشت به تسک‌ها", callback_data=f"view_list_{task['list_id']}")])
         try:
             if isinstance(query_or_update, CallbackQuery):
-                 await target.edit_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                 await target_message.edit_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
             else:
-                 await target.reply_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                 await target_message.reply_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         except BadRequest as e:
             if "Message is not modified" not in str(e):
                 logger.warning(f"Error rendering task view: {e}")
@@ -87,10 +98,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Callback query received: {data}")
     parts = data.split('_')
     action = parts[0]
-    
-    if action == "correct" and parts[1] in ["status", "priority"]:
-        correction_type = parts[1]
-        selected_value = '_'.join(parts[2:])
+
+    prefix_map = {
+        "correct_status_": "status",
+        "correct_priority_": "priority",
+        "correct_assignee_name_": "assignee_name",
+        "correct_list_name_": "list_name"
+    }
+    found_prefix = None
+    for prefix in prefix_map:
+        if data.startswith(prefix):
+            found_prefix = prefix
+            break
+
+    if action == "correct" and found_prefix:
+        correction_type = prefix_map[found_prefix]
+        selected_value = data[len(found_prefix):]
+        
         payload = context.chat_data.get('pending_task_payload')
         
         context.chat_data.pop('conversation_state', None)
@@ -103,7 +127,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payload[correction_type] = selected_value
         task_name = payload.get('task_name', 'بدون نام')
         
-        await query.edit_message_text(f"در حال ساخت تسک '{task_name}' با {correction_type} اصلاح شده '{selected_value}'...")
+        field_names_fa = {
+            "status": "وضعیت",
+            "priority": "اولویت",
+            "assignee_name": "مسئول تسک",
+            "list_name": "لیست"
+        }
+        corrected_field_fa = field_names_fa.get(correction_type, correction_type)
+
+        await query.edit_message_text(f"در حال ساخت تسک '{task_name}' با {corrected_field_fa} اصلاح شده: '{selected_value}'...")
 
         try:
             result = await tools._create_task_tool(update=update, context=context, **payload)
@@ -122,26 +154,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     back_button = None
     if action == "browse" and parts[1] == "spaces":
         text = "لیست فضاها:"
-        spaces = await asyncio.to_thread(database.get_documents, config.SPACES_COLLECTION_ID)
+        spaces = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.SPACES_COLLECTION_ID)
         keyboard = [[InlineKeyboardButton(s['name'], callback_data=f"view_space_{s['clickup_space_id']}")] for s in spaces]
     elif action == "view":
         entity, entity_id = parts[1], '_'.join(parts[2:])
         if entity == "space":
             text = "لیست پوشه‌ها:"
-            folders = await asyncio.to_thread(database.get_documents, config.FOLDERS_COLLECTION_ID, [database.Query.equal("space_id", [entity_id])])
+            folders = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.FOLDERS_COLLECTION_ID, [database.Query.equal("space_id", [entity_id])])
             keyboard = [[InlineKeyboardButton(f['name'], callback_data=f"view_folder_{f['clickup_folder_id']}")] for f in folders]
             back_button = InlineKeyboardButton("↩️ بازگشت به فضاها", callback_data="browse_spaces")
         elif entity == "folder":
             text = "لیست لیست‌ها:"
-            folder = await asyncio.to_thread(database.get_single_document, config.FOLDERS_COLLECTION_ID, 'clickup_folder_id', entity_id)
-            lists = await asyncio.to_thread(database.get_documents, config.LISTS_COLLECTION_ID, [database.Query.equal("folder_id", [entity_id])])
+            folder = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.FOLDERS_COLLECTION_ID, 'clickup_folder_id', entity_id)
+            lists = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, [database.Query.equal("folder_id", [entity_id])])
             keyboard = [[InlineKeyboardButton(l['name'], callback_data=f"view_list_{l['clickup_list_id']}")] for l in lists]
             if folder and folder.get('space_id'):
                 back_button = InlineKeyboardButton("↩️ بازگشت به پوشه‌ها", callback_data=f"view_space_{folder['space_id']}")
         elif entity == "list":
             text = "لیست تسک‌ها:"
-            lst = await asyncio.to_thread(database.get_single_document, config.LISTS_COLLECTION_ID, 'clickup_list_id', entity_id)
-            tasks = await asyncio.to_thread(database.get_documents, config.TASKS_COLLECTION_ID, [database.Query.equal("list_id", [entity_id])])
+            lst = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, 'clickup_list_id', entity_id)
+            tasks = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, [database.Query.equal("list_id", [entity_id])])
             keyboard = [[InlineKeyboardButton(t['title'], callback_data=f"view_task_{t['clickup_task_id']}")] for t in tasks]
             keyboard.append([InlineKeyboardButton("➕ ساخت تسک جدید", callback_data=f"newtask_in_list_{entity_id}")])
             if lst and lst.get('folder_id'):
@@ -156,7 +188,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "confirm" and parts[1] == "delete":
         task_id = '_'.join(parts[2:])
         await query.edit_message_text("در حال حذف تسک...")
-        task = await asyncio.to_thread(database.get_single_document, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
+        task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
         success = await asyncio.to_thread(clickup_api.delete_task_in_clickup, task_id)
         if success:
             await asyncio.to_thread(database.delete_document_by_clickup_id, config.TASKS_COLLECTION_ID, task_id)
@@ -166,14 +198,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "❌ حذف تسک ناموفق بود."
             back_button = InlineKeyboardButton("↩️ بازگشت به تسک", callback_data=f"view_task_{task_id}")
+    
     if not keyboard and not back_button:
         text = "موردی برای نمایش پیدا نشد."
+    
     if back_button:
         keyboard.append([back_button])
+    
     await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def new_task_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lists = await asyncio.to_thread(database.get_documents, config.LISTS_COLLECTION_ID)
+    lists = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID)
     keyboard = [[InlineKeyboardButton(lst['name'], callback_data=f"select_list_{lst['clickup_list_id']}")] for lst in lists]
     keyboard.append([InlineKeyboardButton("لغو ❌", callback_data="cancel_conv")])
     await update.message.reply_text("لطفاً لیستی که تسک باید در آن ساخته شود را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -184,7 +219,7 @@ async def new_task_in_list_start(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     list_id = query.data.split('_')[-1]
     context.user_data['list_id'] = list_id
-    lst = await asyncio.to_thread(database.get_single_document, config.LISTS_COLLECTION_ID, 'clickup_list_id', list_id)
+    lst = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, 'clickup_list_id', list_id)
     list_name = lst['name'] if lst else "انتخاب شده"
     await query.edit_message_text(text=f"ساخت تسک جدید در لیست: *{list_name}*\n\nلطفاً عنوان تسک را وارد کنید (می‌توانید با ارسال /cancel لغو کنید):", parse_mode='Markdown')
     return CREATE_TYPING_TITLE
@@ -235,16 +270,29 @@ async def priority_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     priority = query.data.split('_')[1]
     context.user_data['priority'] = int(priority) if priority != 'skip' else None
-    await query.edit_message_text("تاریخ پایان تسک را وارد کنید (مثال: 2025-12-31) یا با ارسال /skip عبور کنید:")
+    await query.edit_message_text("تاریخ شروع تسک را وارد کنید (مثال: 2025-09-01) یا با ارسال /skip عبور کنید:")
+    return CREATE_TYPING_START_DATE
+
+async def start_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed_timestamp = parse_due_date(update.message.text)
+    if not parsed_timestamp:
+        await update.message.reply_text("فرمت تاریخ اشتباه است. لطفاً دوباره تلاش کنید (YYYY-MM-DD) یا /skip را بزنید.")
+        return CREATE_TYPING_START_DATE
+    context.user_data['start_date'] = parsed_timestamp
+    await update.message.reply_text("تاریخ شروع ذخیره شد. حالا تاریخ پایان تسک را وارد کنید (مثال: 2025-12-31) یا با ارسال /skip عبور کنید:")
+    return CREATE_TYPING_DUE_DATE
+
+async def skip_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['start_date'] = None
+    await update.message.reply_text("تاریخ شروع نادیده گرفته شد. حالا تاریخ پایان تسک را وارد کنید (مثال: 2025-12-31) یا با ارسال /skip عبور کنید:")
     return CREATE_TYPING_DUE_DATE
 
 async def due_date_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        date_obj = datetime.strptime(update.message.text, "%Y-%m-%d")
-        context.user_data['due_date'] = int(date_obj.timestamp() * 1000)
-    except ValueError:
+    parsed_timestamp = parse_due_date(update.message.text)
+    if not parsed_timestamp:
         await update.message.reply_text("فرمت تاریخ اشتباه است. لطفاً دوباره تلاش کنید (YYYY-MM-DD) یا /skip را بزنید.")
         return CREATE_TYPING_DUE_DATE
+    context.user_data['due_date'] = parsed_timestamp
     return await ask_for_assignee(update, context)
 
 async def skip_due_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,7 +300,7 @@ async def skip_due_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_for_assignee(update, context)
 
 async def ask_for_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await asyncio.to_thread(database.get_documents, config.USERS_COLLECTION_ID)
+    users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.USERS_COLLECTION_ID)
     keyboard = [[InlineKeyboardButton(user['username'], callback_data=f"select_user_{user['clickup_user_id']}")] for user in users]
     keyboard.append([InlineKeyboardButton("عبور ➡️", callback_data="select_user_skip")])
     message_text = "عالی! حالا مسئول انجام تسک را انتخاب کنید:"
@@ -273,6 +321,7 @@ async def assignee_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_data.get('assignee_id'): payload["assignees"] = [int(user_data['assignee_id'])]
     if user_data.get('status'): payload["status"] = user_data['status']
     if user_data.get('priority'): payload["priority"] = user_data['priority']
+    if user_data.get('start_date'): payload["start_date"] = user_data['start_date']
     if user_data.get('due_date'): payload["due_date"] = user_data['due_date']
 
     success, task_data = await asyncio.to_thread(clickup_api.create_task_in_clickup_api, user_data['list_id'], payload)
@@ -315,6 +364,7 @@ def get_create_task_conv_handler():
             CREATE_TYPING_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_received), CommandHandler("skip", skip_description)],
             CREATE_SELECTING_STATUS: [CallbackQueryHandler(status_selected, pattern='^select_status_')],
             CREATE_SELECTING_PRIORITY: [CallbackQueryHandler(priority_selected, pattern='^priority_')],
+            CREATE_TYPING_START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_date_received), CommandHandler("skip", skip_start_date)],
             CREATE_TYPING_DUE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, due_date_received), CommandHandler("skip", skip_due_date)],
             CREATE_SELECTING_ASSIGNEE: [CallbackQueryHandler(assignee_selected, pattern='^select_user_')],
         },
@@ -331,10 +381,11 @@ async def show_edit_menu(update_or_message, context: ContextTypes.DEFAULT_TYPE, 
     keyboard = [
         [InlineKeyboardButton("ویرایش عنوان", callback_data="edit_field_name"), InlineKeyboardButton("ویرایش توضیحات", callback_data="edit_field_description")],
         [InlineKeyboardButton("تغییر وضعیت", callback_data="edit_field_status"), InlineKeyboardButton("تغییر اولویت", callback_data="edit_field_priority")],
-        [InlineKeyboardButton("تغییر تاریخ تحویل", callback_data="edit_field_due_date"), InlineKeyboardButton("تغییر مسئول تسک", callback_data="edit_field_assignees")],
+        [InlineKeyboardButton("تغییر تاریخ شروع", callback_data="edit_field_start_date"), InlineKeyboardButton("تغییر تاریخ تحویل", callback_data="edit_field_due_date")],
+        [InlineKeyboardButton("تغییر مسئول تسک", callback_data="edit_field_assignees")],
         [InlineKeyboardButton("↩️ بازگشت به تسک", callback_data="back_to_task")]
     ]
-    target_message = update_or_message.message if isinstance(update_or_message, CallbackQuery) else update_or_message.effective_message
+    target_message = update_or_message if isinstance(update_or_message, Message) else update_or_message.message
     await target_message.edit_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     return EDIT_SELECTING_FIELD
 
@@ -343,7 +394,7 @@ async def edit_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     task_id = '_'.join(query.data.split('_')[2:])
     context.user_data['edit_task_id'] = task_id
-    task = await asyncio.to_thread(database.get_single_document, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
+    task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
     if not task:
         await query.edit_message_text("خطا: تسک مورد نظر یافت نشد.")
         context.user_data.clear()
@@ -364,7 +415,7 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     prompt_text = ""
     keyboard = []
     next_state = EDIT_SELECTING_VALUE
-    if field_to_edit in ['name', 'description', 'due_date']:
+    if field_to_edit in ['name', 'description', 'start_date', 'due_date']:
         next_state = EDIT_TYPING_VALUE
         if field_to_edit == 'name':
             current_value = task.get('title', 'خالی')
@@ -372,6 +423,15 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif field_to_edit == 'description':
             current_value = task.get('content', 'خالی')
             prompt_text = f"توضیحات فعلی: *{current_value}*\n\nلطفاً توضیحات جدید را وارد کنید (یا برای لغو /cancel را بفرستید):"
+        elif field_to_edit == 'start_date':
+            current_value = "تعیین نشده"
+            if task.get('start_date'):
+                try:
+                    dt_object = datetime.fromtimestamp(int(task['start_date']) / 1000)
+                    current_value = dt_object.strftime('%Y-%m-%d')
+                except (ValueError, TypeError):
+                    current_value = "نامشخص"
+            prompt_text = f"تاریخ شروع فعلی: *{current_value}*\n\nتاریخ جدید را وارد کنید (YYYY-MM-DD) یا /cancel را بفرستید:"
         elif field_to_edit == 'due_date':
             current_value = "تعیین نشده"
             if task.get('due_date'):
@@ -395,7 +455,7 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         prompt_text = f"اولویت فعلی: *{task.get('priority', 'N/A')}*\n\nاولویت جدید را انتخاب کنید:"
     elif field_to_edit == 'assignees':
-        users = await asyncio.to_thread(database.get_documents, config.USERS_COLLECTION_ID)
+        users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.USERS_COLLECTION_ID)
         keyboard = [[InlineKeyboardButton(u['username'], callback_data=f"edit_value_{u['clickup_user_id']}")] for u in users]
         prompt_text = "مسئول جدید را انتخاب کنید:"
     if keyboard:
@@ -415,7 +475,7 @@ async def process_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, new_v
         api_value = int(new_value)
     elif field_to_edit == 'assignees':
         api_value = {'add': [int(new_value)], 'rem': []}
-    elif field_to_edit == 'due_date':
+    elif field_to_edit in ['start_date', 'due_date']:
         parsed_timestamp = parse_due_date(new_value)
         if not parsed_timestamp:
             await editable_message.edit_text("❌ فرمت تاریخ نامعتبر است. لطفاً دوباره تلاش کنید.")
@@ -429,6 +489,7 @@ async def process_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, new_v
         if field_to_edit == 'name': task['title'] = new_value
         elif field_to_edit == 'description': task['content'] = new_value
         elif field_to_edit == 'status': task['status'] = new_value
+        elif field_to_edit == 'start_date': task['start_date'] = api_value
         elif field_to_edit == 'due_date': task['due_date'] = api_value
         elif field_to_edit == 'priority':
             priority_val = int(new_value)
@@ -494,3 +555,4 @@ def get_edit_task_conv_handler():
         per_user=True,
         per_chat=True,
     )
+
