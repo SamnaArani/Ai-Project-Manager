@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
  CREATE_SELECTING_STATUS, CREATE_SELECTING_PRIORITY, CREATE_TYPING_START_DATE, 
  CREATE_TYPING_DUE_DATE, CREATE_SELECTING_ASSIGNEE) = range(8)
 (EDIT_SELECTING_FIELD, EDIT_TYPING_VALUE, EDIT_SELECTING_VALUE) = range(8, 11)
+(ONBOARDING_SELECTING_PACKAGE, ONBOARDING_CONFIRM_PAYMENT) = range(11, 13)
 
 # --- توابع کمکی ---
 
@@ -53,15 +55,31 @@ async def _send_or_edit(update: Update, text: str, reply_markup: InlineKeyboardM
 # --- توابع اصلی ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    main_menu_keyboard = [
-        [KeyboardButton("🔍 مرور پروژه‌ها")],
-        [KeyboardButton("➕ ساخت تسک جدید")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True, one_time_keyboard=False)
-    context.user_data.clear()
-    context.chat_data.clear()
-    target = update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("سلام! لطفاً یک گزینه را انتخاب کنید یا دستور خود را تایپ کنید:", reply_markup=reply_markup)
+    user_id = str(update.effective_user.id)
+    user_doc = database.get_single_document(config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id)
+
+    if not user_doc:
+        # User not found, start onboarding process
+        await update.message.reply_text("سلام! به دستیار هوشمند مدیریت پروژه خوش آمدید.\nبرای شروع، لطفاً یک پکیج را انتخاب کنید:")
+        
+        packages = await asyncio.to_thread(database.get_documents, config.PACKAGES_COLLECTION_ID)
+        keyboard = [[InlineKeyboardButton(f"{p['package_name']} ({p['monthly_price']} تومان)", callback_data=f"select_package_{p['$id']}")] for p in packages]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text("پکیج‌ها:", reply_markup=reply_markup)
+        return ONBOARDING_SELECTING_PACKAGE
+    else:
+        # User already exists, show main menu
+        main_menu_keyboard = [
+            [KeyboardButton("🔍 مرور پروژه‌ها")],
+            [KeyboardButton("➕ ساخت تسک جدید")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True, one_time_keyboard=False)
+        context.user_data.clear()
+        context.chat_data.clear()
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text("سلام! لطفاً یک گزینه را انتخاب کنید یا دستور خود را تایپ کنید:", reply_markup=reply_markup)
+    return ConversationHandler.END
 
 async def browse_projects_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("نمایش فضاها (Spaces)", callback_data="browse_spaces")]]
@@ -157,7 +175,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "لطفاً انتخاب کنید:"
     back_button = None
     if action == "browse" and parts[1] == "spaces":
-        text, keyboard = "لیست فضاها:", [[InlineKeyboardButton(s['name'], callback_data=f"view_space_{s['clickup_space_id']}")] for s in await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.SPACES_COLLECTION_ID)]
+        keyboard = [[InlineKeyboardButton(s['name'], callback_data=f"view_space_{s['clickup_space_id']}")] for s in await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.SPACES_COLLECTION_ID)]
     elif action == "view":
         entity, entity_id = parts[1], '_'.join(parts[2:])
         if entity == "space":
@@ -319,7 +337,7 @@ async def skip_due_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_for_assignee(update, context)
 
 async def ask_for_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.USERS_COLLECTION_ID)
+    users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID)
     keyboard = [[InlineKeyboardButton(user['username'], callback_data=f"select_user_{user['clickup_user_id']}")] for user in users]
     keyboard.append([InlineKeyboardButton("↪️ بازگشت به تاریخ پایان", callback_data="back_to_due_date"), InlineKeyboardButton("عبور ➡️", callback_data="select_user_skip")])
     await _send_or_edit(update, "مسئول انجام تسک را انتخاب کنید:", InlineKeyboardMarkup(keyboard))
@@ -462,8 +480,9 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard = [[InlineKeyboardButton(p_name, callback_data=f"edit_value_{p_val}")] for p_name, p_val in [("فوری",1), ("بالا",2), ("متوسط",3), ("پایین",4), ("حذف",0)]]
         prompt_text = f"اولویت فعلی: *{task.get('priority', 'N/A')}*\n\nاولویت جدید را انتخاب کنید:"
     elif field_to_edit == 'assignees':
-        users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.USERS_COLLECTION_ID)
+        users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID)
         keyboard = [[InlineKeyboardButton(u['username'], callback_data=f"edit_value_{u['clickup_user_id']}")] for u in users]
+        keyboard.append([InlineKeyboardButton("حذف مسئول", callback_data=f"edit_value_null")])
         prompt_text = "مسئول جدید را انتخاب کنید:"
 
     if keyboard: keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_edit_field")])
@@ -479,7 +498,7 @@ async def process_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, new_v
     payload, api_value = {}, new_value
     
     if field == 'priority': api_value = int(new_value)
-    elif field == 'assignees': api_value = {'add': [int(new_value)], 'rem': []}
+    elif field == 'assignees': api_value = {'add': [int(new_value)]} if new_value != "null" else {'rem': [int(context.user_data['task'].get('assignee_id'))]}
     elif 'date' in field:
         if new_value.lower() in ['remove', 'حذف', 'خالی']:
             api_value = None
@@ -511,6 +530,37 @@ async def back_to_task_from_edit(update: Update, context: ContextTypes.DEFAULT_T
     if task_id: await render_task_view(query, task_id)
     return ConversationHandler.END
 
+def get_create_task_conv_handler():
+    states = {
+        CREATE_SELECTING_LIST: [CallbackQueryHandler(new_task_in_list_start, pattern='^select_list_')],
+        CREATE_TYPING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title_received), 
+                              CallbackQueryHandler(new_task_entry, pattern='^back_to_list_selection$')],
+        CREATE_TYPING_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_received), 
+                                    CallbackQueryHandler(skip_description, pattern='^skip_description$'), 
+                                    CallbackQueryHandler(ask_for_title, pattern='^back_to_title$')],
+        CREATE_SELECTING_STATUS: [CallbackQueryHandler(status_selected, pattern='^select_status_'), 
+                                  CallbackQueryHandler(ask_for_description, pattern='^back_to_description$')],
+        CREATE_SELECTING_PRIORITY: [CallbackQueryHandler(priority_selected, pattern='^priority_'), 
+                                    CallbackQueryHandler(ask_for_status, pattern='^back_to_status$')],
+        CREATE_TYPING_START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_date_received), 
+                                   CommandHandler("skip", skip_start_date), 
+                                   CallbackQueryHandler(ask_for_priority, pattern='^back_to_priority$')],
+        CREATE_TYPING_DUE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, due_date_received), 
+                                 CommandHandler("skip", skip_due_date), 
+                                 CallbackQueryHandler(ask_for_start_date, pattern='^back_to_start_date$')],
+        CREATE_SELECTING_ASSIGNEE: [CallbackQueryHandler(assignee_selected, pattern='^select_user_'), 
+                                    CallbackQueryHandler(ask_for_due_date, pattern='^back_to_due_date$')],
+    }
+    return ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^➕ ساخت تسک جدید$'), new_task_entry), 
+                      CallbackQueryHandler(new_task_in_list_start, pattern='^newtask_in_list_')],
+        states=states,
+        fallbacks=[CommandHandler("cancel", cancel_conversation), 
+                   CallbackQueryHandler(cancel_conversation, pattern='^cancel_conv$')],
+        per_chat=True,
+        per_user=True,
+    )
+
 def get_edit_task_conv_handler():
     return ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_task_start, pattern='^edit_task_')],
@@ -526,3 +576,60 @@ def get_edit_task_conv_handler():
         per_chat=True,
     )
 
+
+# --- Onboarding Conversation ---
+
+async def select_package_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    package_id = query.data.split('_')[-1]
+    
+    package_doc = await asyncio.to_thread(database.get_single_document, config.PACKAGES_COLLECTION_ID, '$id', package_id)
+    if not package_doc:
+        await query.edit_message_text("❌ پکیج مورد نظر یافت نشد. لطفاً دوباره تلاش کنید.")
+        return ConversationHandler.END
+
+    user_id = str(update.effective_user.id)
+    user_data = {
+        'telegram_id': user_id,
+        'is_active': True,
+        'is_admin': False,
+        'package_id': package_id,
+        'used_count': 0
+    }
+
+    if package_doc.get('monthly_price') == 0:
+        # Free package, immediately activate user
+        await asyncio.to_thread(database.upsert_document, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id, user_data)
+        await query.edit_message_text(f"✅ پکیج رایگان برای شما فعال شد! از این پس می‌توانید از ربات استفاده کنید.")
+        # Re-run start command to show main menu
+        await start_command(update, context)
+        return ConversationHandler.END
+    else:
+        # Paid package, show payment info
+        await asyncio.to_thread(database.upsert_document, config.PAYMENT_REQUESTS_COLLECTION_ID, 'user_id', user_id, {
+            'user_id': user_id,
+            'package_id': package_id,
+            'status': 'pending',
+            'payment_info': 'Awaiting user payment'
+        })
+        
+        payment_info_text = f"برای فعال‌سازی پکیج '{package_doc.get('package_name')}' با مبلغ {package_doc.get('monthly_price')} تومان، لطفاً مبلغ را به یکی از روش‌های زیر واریز کنید:\n\n"
+        payment_info_text += "شماره حساب:\n`1234-5678-9012-3456`\n"
+        payment_info_text += "آدرس کیف پول:\n`0x123...abc`\n\n"
+        payment_info_text += "پس از پرداخت، لطفا تصویر فیش واریزی را برای من ارسال کنید."
+        
+        await query.edit_message_text(payment_info_text, parse_mode='Markdown')
+        context.user_data['package_id'] = package_id
+        return ONBOARDING_CONFIRM_PAYMENT
+
+def get_onboarding_conv_handler():
+    return ConversationHandler(
+        entry_points=[CommandHandler("start", start_command)],
+        states={
+            ONBOARDING_SELECTING_PACKAGE: [CallbackQueryHandler(select_package_onboarding, pattern='^select_package_')],
+            ONBOARDING_CONFIRM_PAYMENT: [MessageHandler(filters.PHOTO, confirm_payment)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        per_user=True,
+        per_chat=True,
+    )
