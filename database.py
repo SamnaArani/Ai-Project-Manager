@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import logging
 from appwrite.client import Client
 from appwrite.services.databases import Databases
@@ -22,6 +23,10 @@ def get_db_client():
             .set_self_signed()
         )
     return _client
+
+async def get_databases_service():
+    """یک نمونه سرویس Databases ایجاد و بازمی‌گرداند."""
+    return Databases(get_db_client())
 
 def get_documents(collection_id, queries=None):
     try:
@@ -73,3 +78,73 @@ def delete_document_by_clickup_id(collection_id, clickup_id):
             logger.info(f"سند با ClickUp ID {clickup_id} از کالکشن {collection_id} حذف شد.")
         except AppwriteException as e:
             logger.error(f"خطای Appwrite در حذف سند با ClickUp ID {clickup_id}: {e}")
+
+async def create_bot_users_collection_if_not_exists():
+    """کالکشن bot_users را در صورت عدم وجود ایجاد می‌کند."""
+    db = Databases(get_db_client())
+    try:
+        # Check if collection exists
+        db.get_collection(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID)
+        logger.info("کالکشن bot_users از قبل وجود دارد.")
+    except AppwriteException as e:
+        if e.code == 404:
+            try:
+                # Create collection
+                db.create_collection(
+                    database_id=config.APPWRITE_DATABASE_ID,
+                    collection_id=config.BOT_USERS_COLLECTION_ID,
+                    name="Bot Users",
+                    permissions=['read("any")', 'create("any")', 'update("any")']
+                )
+                logger.info("کالکشن bot_users با موفقیت ایجاد شد.")
+            except AppwriteException as e:
+                logger.error(f"خطا در ایجاد کالکشن bot_users: {e}")
+                return
+
+            try:
+                # Create attributes for the collection
+                db.create_string_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "telegram_id", 128, required=True, array=False)
+                db.create_string_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "clickup_token", 2048, required=False, array=False)
+                db.create_boolean_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "is_admin", required=True, default=False)
+                db.create_boolean_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "is_active", required=True, default=False)
+                db.create_string_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "package_id", 128, required=False, array=False)
+                db.create_integer_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "usage_limit", required=False)
+                db.create_integer_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "used_count", required=True, default=0)
+                db.create_datetime_attribute(config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, "expiry_date", required=False)
+                logger.info("اتریبیوت‌های کالکشن bot_users با موفقیت ایجاد شدند.")
+            except AppwriteException as e:
+                logger.error(f"خطا در ایجاد اتریبیوت‌های کالکشن bot_users: {e}")
+        else:
+            logger.error(f"خطای Appwrite در بررسی کالکشن bot_users: {e}")
+            
+async def create_packages_collection_if_not_exists():
+    """کالکشن packages را در صورت عدم وجود ایجاد می‌کند."""
+    db = Databases(get_db_client())
+    try:
+        db.get_collection(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID)
+        logger.info("کالکشن packages از قبل وجود دارد.")
+    except AppwriteException as e:
+        if e.code == 404:
+            try:
+                db.create_collection(
+                    database_id=config.APPWRITE_DATABASE_ID,
+                    collection_id=config.PACKAGES_COLLECTION_ID,
+                    name="Packages",
+                    permissions=['read("any")']
+                )
+                logger.info("کالکشن packages با موفقیت ایجاد شد.")
+            except AppwriteException as e:
+                logger.error(f"خطا در ایجاد کالکشن packages: {e}")
+                return
+
+            try:
+                db.create_string_attribute(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, "package_name", 128, required=True, array=False)
+                db.create_integer_attribute(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, "ai_call_limit", required=False)
+                db.create_integer_attribute(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, "monthly_price", required=True, default=0)
+                db.create_boolean_attribute(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, "is_active", required=True, default=True)
+                db.create_string_attribute(config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, "package_description", 2048, required=False, array=False)
+                logger.info("اتریبیوت‌های کالکشن packages با موفقیت ایجاد شدند.")
+            except AppwriteException as e:
+                logger.error(f"خطا در ایجاد اتریبیوت‌های کالکشن packages: {e}")
+        else:
+            logger.error(f"خطای Appwrite در بررسی کالکشن packages: {e}")
