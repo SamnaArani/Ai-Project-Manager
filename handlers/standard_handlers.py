@@ -205,7 +205,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if folder and folder.get('space_id'): back_button = InlineKeyboardButton("↩️ بازگشت به پوشه‌ها", callback_data=f"view_space_{folder['space_id']}")
         elif entity == "list":
             text = "لیست تسک‌ها:"
-            lst = await asyncio.to_thread(database.get_single_document_by_user, config.LISTS_COLLECTION_ID, 'clickup_list_id', entity_id, user_id)
+            lst = await asyncio.to_thread(database.get_single_document_by_user, config.LISTS_COLLECTION_ID, user_id, [database.Query.equal("list_id", [entity_id])])
             tasks = await asyncio.to_thread(database.get_documents_by_user, config.TASKS_COLLECTION_ID, user_id, [database.Query.equal("list_id", [entity_id])])
             keyboard = [[InlineKeyboardButton(t['title'], callback_data=f"view_task_{t['clickup_task_id']}")] for t in tasks]
             keyboard.append([InlineKeyboardButton("➕ ساخت تسک جدید", callback_data=f"newtask_in_list_{entity_id}")])
