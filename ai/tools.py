@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timedelta
 from dateutil.parser import parse as dateutil_parse
 from thefuzz import process as fuzz_process
@@ -51,7 +52,7 @@ def _find_task_in_db(task_name: str, list_name: str) -> Optional[Tuple[Dict[str,
     list_choices = {lst['name']: lst['clickup_list_id'] for lst in lists}
     
     best_list_match, list_score = fuzz_process.extractOne(list_name, list_choices.keys())
-    if list_score < 85:
+    if list_score < 90:
         all_list_names = ", ".join(list_choices.keys())
         raise ValueError(f"لیست '{list_name}' یافت نشد. لیست‌های موجود: {all_list_names}")
 
@@ -64,10 +65,10 @@ def _find_task_in_db(task_name: str, list_name: str) -> Optional[Tuple[Dict[str,
     task_titles = {task['title']: task for task in tasks_in_list}
     best_match, score = fuzz_process.extractOne(task_name, task_titles.keys())
 
-    if score > 80:
+    if score > 90:
         return task_titles[best_match], best_list_match
     else:
-        raise ValueError(f"تسک با نام نزدیک به '{task_name}' در لیست '{best_list_match}' یافت نشد.")
+        raise ValueError(f"تسک با نام نزدیک به '{task_name}' در لیست '{best_list_match}' یافت نشد. آیا منظورتان '{best_match}' بود؟")
 
 
 # --- ابزارهای اصلی ---
@@ -178,6 +179,119 @@ async def _create_task_tool(
     
     return {"message": f"✅ تسک '{task_name}' با موفقیت ساخته شد.", "url": task_data.get('url')}
 
+async def _update_task_tool(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE,
+    task_name: str, 
+    list_name: str,
+    new_name: Optional[str] = None,
+    new_description: Optional[str] = None,
+    new_status: Optional[str] = None,
+    new_priority: Optional[str] = None,
+    new_assignee: Optional[str] = None,
+    new_due_date: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """ابزار هوشمند به‌روزرسانی تسک با قابلیت اصلاح تعاملی."""
+    
+    original_args = {k: v for k, v in locals().items() if k not in ['update', 'context'] and v is not None}
+    logger.info(f"در حال تلاش برای به‌روزرسانی تسک '{task_name}' در لیست '{list_name}'")
+    
+    try:
+        task, list_name_found = _find_task_in_db(task_name, list_name)
+    except ValueError as e:
+        error_msg = str(e)
+        if "یافت نشد. آیا منظورتان" in error_msg:
+            # Handle interactive correction for task name
+            context.chat_data['conversation_state'] = 'awaiting_task_correction'
+            context.chat_data['pending_update_payload'] = original_args
+            
+            # Extract suggested task name from error message
+            match = re.search(r"منظورتان '(.+)' بود؟", error_msg)
+            suggested_task = match.group(1) if match else None
+            
+            keyboard = [[InlineKeyboardButton(suggested_task, callback_data=f"correct_task_name_{suggested_task}")]] if suggested_task else []
+            keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_conv")])
+            
+            await update.message.reply_text(error_msg.replace("آیا منظورتان", "⚠️").replace("بود؟", "؟"), reply_markup=InlineKeyboardMarkup(keyboard))
+            return None
+        else:
+            raise
+
+    payload = {}
+    if new_name: payload['name'] = new_name
+    if new_description: payload['description'] = new_description
+    if new_assignee:
+        users = database.get_documents(config.APPWRITE_DATABASE_ID, config.USERS_COLLECTION_ID)
+        user_choices = {user['username']: user['clickup_user_id'] for user in users}
+        best_user_match, user_score = fuzz_process.extractOne(new_assignee, user_choices.keys())
+        if user_score > 85:
+            payload['assignees'] = [int(user_choices[best_user_match])]
+        else:
+            context.chat_data['conversation_state'] = 'awaiting_assignee_correction_update'
+            context.chat_data['pending_update_payload'] = original_args
+            keyboard = [[InlineKeyboardButton(name, callback_data=f"correct_assignee_update_{name}")] for name in user_choices.keys()]
+            await update.message.reply_text(f"⚠️ کاربر «{new_assignee}» یافت نشد. لطفاً کاربر صحیح را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return None
+    if new_status:
+        list_statuses = await asyncio.to_thread(clickup_api.get_list_statuses, task['list_id'])
+        valid_status_names = [s['status'] for s in list_statuses]
+        best_status_match, status_score = fuzz_process.extractOne(new_status, valid_status_names)
+        if status_score > 85:
+            payload['status'] = best_status_match
+        else:
+            context.chat_data['conversation_state'] = 'awaiting_status_correction_update'
+            context.chat_data['pending_update_payload'] = original_args
+            keyboard = [[InlineKeyboardButton(s, callback_data=f"correct_status_update_{s}")] for s in valid_status_names]
+            await update.message.reply_text(f"⚠️ وضعیت «{new_status}» معتبر نیست. لطفاً انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return None
+    
+    priority_map = {"فوری": 1, "بالا": 2, "متوسط": 3, "پایین": 4}
+    if new_priority:
+        best_priority_match, _ = fuzz_process.extractOne(new_priority, priority_map.keys())
+        if best_priority_match:
+            payload['priority'] = priority_map[best_priority_match]
+        else:
+            context.chat_data['conversation_state'] = 'awaiting_priority_correction_update'
+            context.chat_data['pending_update_payload'] = original_args
+            keyboard = [[InlineKeyboardButton(p, callback_data=f"correct_priority_update_{p}")] for p in priority_map.keys()]
+            await update.message.reply_text(f"⚠️ اولویت «{new_priority}» معتبر نیست. لطفاً انتخاب کنید:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return None
+
+    if new_due_date and (due_timestamp := parse_date(new_due_date)): payload["due_date"] = due_timestamp
+
+    if not payload:
+        raise ValueError("هیچ تغییری برای اعمال مشخص نشده است.")
+    
+    success, response_data = await asyncio.to_thread(clickup_api.update_task_in_clickup_api, task['clickup_task_id'], payload)
+    
+    if not success:
+        raise Exception(f"ClickUp API error: {response_data.get('err', 'Unknown error')}")
+        
+    synced_task = await asyncio.to_thread(clickup_api.sync_single_task_from_clickup, task['clickup_task_id'])
+    
+    if synced_task:
+        def format_dt(ts): 
+            if not ts: return "خالی"
+            if isinstance(ts, int):
+                return datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d')
+            return ts
+            
+        details = [
+            f"✅ تسک '{task['title']}' با موفقیت به‌روزرسانی شد. جزئیات جدید:",
+            f"🏷️ *عنوان:* {synced_task.get('title', 'خالی')}",
+            f"📝 *توضیحات:* {synced_task.get('content', 'خالی') or 'خالی'}",
+            f"🗂️ *لیست:* {list_name_found}",
+            f"👤 *مسئول:* {synced_task.get('assignee_name', 'خالی') or 'خالی'}",
+            f"📊 *وضعیت:* {synced_task.get('status', 'خالی') or 'خالی'}",
+            f"❗️ *اولویت:* {synced_task.get('priority', 'خالی') or 'خالی'}",
+            f"🗓️ *تاریخ شروع:* {format_dt(synced_task.get('start_date'))}",
+            f"🏁 *تاریخ تحویل:* {format_dt(synced_task.get('due_date'))}"
+        ]
+        return {"message": "\n".join(details), "url": response_data.get('url')}
+
+    return {"message": f"✅ تسک '{task_name}' با موفقیت به‌روزرسانی شد. ", "url": response_data.get('url')}
+
+
 async def _confirm_and_delete_task_tool(
     update: Update, 
     context: ContextTypes.DEFAULT_TYPE,
@@ -229,8 +343,7 @@ async def ask_user_tool(
 # --- مپینگ ابزارها ---
 TOOL_MAPPING = {
     "create_task": _create_task_tool,
-    "update_task": None, # فعلاً غیرفعال
+    "update_task": _update_task_tool,
     "confirm_and_delete_task": _confirm_and_delete_task_tool,
     "ask_user": ask_user_tool,
 }
-
