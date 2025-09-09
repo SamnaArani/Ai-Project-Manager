@@ -44,7 +44,8 @@ async def _get_user_token(user_id: str, update: Update, context: ContextTypes.DE
         return user_doc['clickup_token']
     else:
         target = update.callback_query.message if update.callback_query else update.message
-        await target.reply_text("توکن ClickUp شما یافت نشد یا حساب شما غیرفعال است. لطفاً با دستور /start ثبت نام کنید.")
+        if target:
+            await target.reply_text("توکن ClickUp شما یافت نشد یا حساب شما غیرفعال است. لطفاً با دستور /start ثبت نام کنید.")
         return None
 
 def parse_due_date(due_date_str: str) -> int | None:
@@ -89,7 +90,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 database.create_document,
                 config.APPWRITE_DATABASE_ID,
                 config.BOT_USERS_COLLECTION_ID,
-                {'telegram_id': user_id, 'is_active': False, 'is_admin': False}
+                {
+                    'telegram_id': user_id, 
+                    'is_active': False, 
+                    'is_admin': False,
+                    'created_at': datetime.now(timezone.utc).isoformat()
+                }
             )
         await update.message.reply_text(
             "👋 سلام! به ربات مدیریت پروژه PIXEELL خوش آمدید.\n\n"
@@ -119,13 +125,8 @@ async def token_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_valid = await asyncio.to_thread(clickup_api.validate_token, token)
 
     if is_valid:
-        await placeholder_message.edit_text("توکن معتبر است. در حال همگام‌سازی اولیه اطلاعات... ⏳")
-        sync_success = await asyncio.to_thread(clickup_api.sync_all_user_data, token)
-
-        if not sync_success:
-            await placeholder_message.edit_text("❌ در همگام‌سازی اولیه اطلاعات خطایی رخ داد.")
-            return GET_CLICKUP_TOKEN
-
+        # [FIX] Save the token immediately after validation
+        await placeholder_message.edit_text("توکن معتبر است. در حال ذخیره اطلاعات...")
         await asyncio.to_thread(
             database.upsert_document,
             config.APPWRITE_DATABASE_ID,
@@ -134,7 +135,15 @@ async def token_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id,
             {'clickup_token': token, 'is_active': True}
         )
-        await placeholder_message.edit_text("✅ توکن شما با موفقیت ذخیره و فعال شد!")
+        await placeholder_message.edit_text("توکن شما با موفقیت ذخیره شد. در حال همگام‌سازی اولیه اطلاعات... ⏳")
+        
+        sync_success = await asyncio.to_thread(clickup_api.sync_all_user_data, token, user_id)
+
+        if not sync_success:
+            await placeholder_message.edit_text("❌ در همگام‌سازی اولیه اطلاعات خطایی رخ داد. لطفاً با دستور /resync مجدداً تلاش کنید.")
+            return ConversationHandler.END # End conversation even if sync fails, token is saved.
+
+        await placeholder_message.edit_text("✅ همگام‌سازی با موفقیت انجام شد!")
         
         main_menu_keyboard = [[KeyboardButton("🔍 مرور پروژه‌ها")], [KeyboardButton("➕ ساخت تسک جدید")]]
         reply_markup = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True)
@@ -151,15 +160,41 @@ async def cancel_auth_conversation(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 def get_auth_handler() -> ConversationHandler:
+    # [FIX] Make the filter more specific to avoid capturing menu button clicks
+    token_filter = (
+        filters.TEXT & 
+        ~filters.COMMAND & 
+        ~filters.Regex('^🔍 مرور پروژه‌ها$') & 
+        ~filters.Regex('^➕ ساخت تسک جدید$')
+    )
     return ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
-            GET_CLICKUP_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, token_received)],
+            GET_CLICKUP_TOKEN: [MessageHandler(token_filter, token_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel_auth_conversation)],
     )
 
 # --- توابع اصلی ---
+
+async def resync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually triggers a full data sync for the user."""
+    user_id = str(update.effective_user.id)
+    token = await _get_user_token(user_id, update, context)
+    if not token:
+        await update.message.reply_text("ابتدا باید با دستور /start ثبت نام کنید.")
+        return
+
+    await update.message.reply_text("شروع همگام‌سازی مجدد اطلاعات از ClickUp... این فرآیند ممکن است چند لحظه طول بکشد. ⏳")
+    try:
+        sync_success = await asyncio.to_thread(clickup_api.sync_all_user_data, token, user_id)
+        if sync_success:
+            await update.message.reply_text("✅ همگام‌سازی مجدد با موفقیت انجام شد. اکنون همه چیز باید به درستی کار کند.")
+        else:
+            await update.message.reply_text("❌ در هنگام همگام‌سازی مجدد خطایی رخ داد.")
+    except Exception as e:
+        logger.error(f"خطا در اجرای دستور /resync برای کاربر {user_id}: {e}", exc_info=True)
+        await update.message.reply_text("❌ یک خطای غیرمنتظره در حین همگام‌سازی رخ داد.")
 
 async def browse_projects_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -170,42 +205,47 @@ async def browse_projects_entry(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("برای شروع مرور، روی دکمه زیر کلیک کنید:", reply_markup=reply_markup)
 
 async def render_task_view(query_or_update, task_id):
-    target_message = query_or_update.message if isinstance(query_or_update, CallbackQuery) else query_or_update
-    task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
+    user_id = str(query_or_update.from_user.id)
+    task = await asyncio.to_thread(
+        database.get_single_document, 
+        config.APPWRITE_DATABASE_ID, 
+        config.TASKS_COLLECTION_ID, 
+        'clickup_task_id', 
+        task_id
+    )
+    if not task or task.get('telegram_id') != user_id:
+        await _send_or_edit(query_or_update, "تسک پیدا نشد یا شما به آن دسترسی ندارید.")
+        return
+
+    def format_date(timestamp_ms):
+        if not timestamp_ms: return "خالی"
+        try: return datetime.fromtimestamp(int(timestamp_ms) / 1000).strftime('%Y-%m-%d')
+        except (ValueError, TypeError): return "نامشخص"
     
-    if task:
-        def format_date(timestamp_ms):
-            if not timestamp_ms: return "خالی"
-            try: return datetime.fromtimestamp(int(timestamp_ms) / 1000).strftime('%Y-%m-%d')
-            except (ValueError, TypeError): return "نامشخص"
-        
-        list_doc = None
-        if list_id := task.get('list_id'):
-            list_doc = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, 'clickup_list_id', list_id)
+    list_doc = None
+    if list_id := task.get('list_id'):
+        list_doc = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, 'clickup_list_id', list_id)
 
-        details = [
-            f"🏷️ *عنوان:* {task.get('title', 'خالی')}",
-            f"📝 *توضیحات:* {task.get('content', 'خالی') or 'خالی'}",
-            f"🗂️ *لیست:* {list_doc['name'] if list_doc else 'نامشخص'}",
-            f"👤 *مسئول:* {task.get('assignee_name', 'خالی') or 'خالی'}",
-            f"📊 *وضعیت:* {task.get('status', 'خالی') or 'خالی'}",
-            f"❗️ *اولویت:* {task.get('priority', 'خالی') or 'خالی'}",
-            f"🗓️ *تاریخ شروع:* {format_date(task.get('start_date'))}",
-            f"🏁 *تاریخ تحویل:* {format_date(task.get('due_date'))}"
-        ]
-        text = "\n".join(details)
-        
-        keyboard = [
-            [InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_task_{task_id}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_task_{task_id}")]
-        ]
-        if task.get('list_id'):
-            keyboard.append([InlineKeyboardButton("↩️ بازگشت به تسک‌ها", callback_data=f"view_list_{task['list_id']}")])
-        
-        await _send_or_edit(query_or_update, text, InlineKeyboardMarkup(keyboard))
+    details = [
+        f"🏷️ *عنوان:* {task.get('title', 'خالی')}",
+        f"📝 *توضیحات:* {task.get('content', 'خالی') or 'خالی'}",
+        f"🗂️ *لیست:* {list_doc['name'] if list_doc else 'نامشخص'}",
+        f"👤 *مسئول:* {task.get('assignee_name', 'خالی') or 'خالی'}",
+        f"📊 *وضعیت:* {task.get('status', 'خالی') or 'خالی'}",
+        f"❗️ *اولویت:* {task.get('priority', 'خالی') or 'خالی'}",
+        f"🗓️ *تاریخ شروع:* {format_date(task.get('start_date'))}",
+        f"🏁 *تاریخ تحویل:* {format_date(task.get('due_date'))}"
+    ]
+    text = "\n".join(details)
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_task_{task_id}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_task_{task_id}")]
+    ]
+    if task.get('list_id'):
+        keyboard.append([InlineKeyboardButton("↩️ بازگشت به تسک‌ها", callback_data=f"view_list_{task['list_id']}")])
+    
+    await _send_or_edit(query_or_update, text, InlineKeyboardMarkup(keyboard))
 
-    else:
-        target = query_or_update.message if isinstance(query_or_update, CallbackQuery) else query_or_update
-        await target.reply_text("تسک پیدا نشد.")
 
 async def _handle_update_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, correction_type: str, selected_value: str):
     from handlers import ai_handlers
@@ -238,7 +278,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split('_')
     action = parts[0]
 
-    # ... (rest of the button handler logic will go here)
     prefix_map = {
         "correct_status_": "status", "correct_priority_": "priority",
         "correct_assignee_name_": "assignee_name", "correct_list_name_": "list_name"
@@ -260,7 +299,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"در حال اعمال مقدار اصلاح شده: '{selected_value}'...")
 
         try:
-            # We must pass the token here as well.
             result = await tools.create_task(update=update, context=context, **payload)
             if result:
                  final_message = result.get('message', 'عملیات با موفقیت انجام شد.')
@@ -276,39 +314,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard, text, back_button = [], "لطفاً انتخاب کنید:", None
+    user_query = [Query.equal("telegram_id", [user_id])]
+
     if action == "browse" and parts[1] == "spaces":
-        docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.SPACES_COLLECTION_ID)
+        docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.SPACES_COLLECTION_ID, user_query)
         text, keyboard = "لیست فضاها:", [[InlineKeyboardButton(s['name'], callback_data=f"view_space_{s['clickup_space_id']}")] for s in docs]
+    
     elif action == "view":
         entity, entity_id = parts[1], '_'.join(parts[2:])
         if entity == "space":
             text = "لیست پوشه‌ها:"
-            docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.FOLDERS_COLLECTION_ID, [Query.equal("space_id", [entity_id])])
+            space_query = user_query + [Query.equal("space_id", [entity_id])]
+            docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.FOLDERS_COLLECTION_ID, space_query)
             keyboard = [[InlineKeyboardButton(f['name'], callback_data=f"view_folder_{f['clickup_folder_id']}")] for f in docs]
             back_button = InlineKeyboardButton("↩️ بازگشت به فضاها", callback_data="browse_spaces")
         elif entity == "folder":
             text = "لیست لیست‌ها:"
             folder = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.FOLDERS_COLLECTION_ID, 'clickup_folder_id', entity_id)
-            docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, [Query.equal("folder_id", [entity_id])])
+            folder_query = user_query + [Query.equal("folder_id", [entity_id])]
+            docs = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, folder_query)
             keyboard = [[InlineKeyboardButton(l['name'], callback_data=f"view_list_{l['clickup_list_id']}")] for l in docs]
             if folder and folder.get('space_id'): back_button = InlineKeyboardButton("↩️ بازگشت به پوشه‌ها", callback_data=f"view_space_{folder['space_id']}")
         elif entity == "list":
             text = "لیست تسک‌ها:"
             lst = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, 'clickup_list_id', entity_id)
-            tasks = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, [Query.equal("list_id", [entity_id])])
+            list_query = user_query + [Query.equal("list_id", [entity_id])]
+            tasks = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, list_query)
             keyboard = [[InlineKeyboardButton(t['title'], callback_data=f"view_task_{t['clickup_task_id']}")] for t in tasks]
             keyboard.append([InlineKeyboardButton("➕ ساخت تسک جدید", callback_data=f"newtask_in_list_{entity_id}")])
             keyboard.append([InlineKeyboardButton("🔄 رفرش", callback_data=f"refresh_list_{entity_id}")]) 
             if lst and lst.get('folder_id'): back_button = InlineKeyboardButton("↩️ بازگشت به لیست‌ها", callback_data=f"view_folder_{lst['folder_id']}")
         elif entity == "task": await render_task_view(query, entity_id); return
+
     elif action == "refresh" and parts[1] == "list":
         list_id = '_'.join(parts[2:])
         await query.edit_message_text("در حال همگام‌سازی تسک‌ها از ClickUp... 🔄")
         try:
-            sync_call = partial(clickup_api.sync_tasks_for_list, list_id, token=token)
+            sync_call = partial(clickup_api.sync_tasks_for_list, list_id, token=token, telegram_id=user_id)
             synced_count = await asyncio.to_thread(sync_call)
             text = f"همگام‌سازی کامل شد. {synced_count} تسک پردازش شد.\n\nلیست تسک‌ها:"
-            tasks = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, [Query.equal("list_id", [list_id])])
+            list_query = user_query + [Query.equal("list_id", [list_id])]
+            tasks = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, list_query)
             keyboard = [[InlineKeyboardButton(t['title'], callback_data=f"view_task_{t['clickup_task_id']}")] for t in tasks]
             keyboard.append([InlineKeyboardButton("➕ ساخت تسک جدید", callback_data=f"newtask_in_list_{list_id}")])
             keyboard.append([InlineKeyboardButton("🔄 رفرش", callback_data=f"refresh_list_{list_id}")])
@@ -317,13 +363,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"خطا در هنگام رفرش لیست {list_id}: {e}", exc_info=True)
             text, back_button = "❌ خطایی در هنگام همگام‌سازی رخ داد.", InlineKeyboardButton("↩️ بازگشت", callback_data=f"view_list_{list_id}")
+
     elif action == "delete" and parts[1] == "task":
         task_id = '_'.join(parts[2:])
         text, keyboard = "آیا از حذف این تسک مطمئن هستید؟", [[InlineKeyboardButton("✅ بله", callback_data=f"confirm_delete_{task_id}")], [InlineKeyboardButton("❌ خیر", callback_data=f"view_task_{task_id}")]]
+    
     elif action == "confirm" and parts[1] == "delete":
         task_id = '_'.join(parts[2:])
         await query.edit_message_text("در حال حذف تسک...")
         task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
+        
+        if not task or task.get('telegram_id') != user_id:
+            await query.edit_message_text("خطا: تسک برای حذف یافت نشد یا شما دسترسی ندارید.")
+            return
+
         delete_call = partial(clickup_api.delete_task_in_clickup, task_id, token=token)
         if await asyncio.to_thread(delete_call):
             db_delete_call = partial(database.delete_document_by_clickup_id, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
@@ -333,7 +386,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text, back_button = "❌ حذف تسک از ClickUp ناموفق بود.", InlineKeyboardButton("↩️ بازگشت به تسک", callback_data=f"view_task_{task_id}")
     
-    if not keyboard and not back_button: text = "موردی برای نمایش پیدا نشد."
+    if not keyboard and not text == "لطفاً انتخاب کنید:": text = "موردی برای نمایش پیدا نشد."
     if back_button: keyboard.append([back_button])
     await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -343,7 +396,13 @@ async def new_task_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not await _get_user_token(user_id, update, context): return ConversationHandler.END
 
-    lists = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID)
+    user_query = [Query.equal("telegram_id", [user_id])]
+    lists = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.LISTS_COLLECTION_ID, user_query)
+    
+    if not lists:
+        await _send_or_edit(update, "هیچ لیستی برای ساخت تسک یافت نشد. لطفاً از همگام‌سازی اطلاعات خود مطمئن شوید.")
+        return ConversationHandler.END
+
     keyboard = [[InlineKeyboardButton(lst['name'], callback_data=f"select_list_{lst['clickup_list_id']}")] for lst in lists]
     keyboard.append([InlineKeyboardButton("لغو ❌", callback_data="cancel_conv")])
     await _send_or_edit(update, "لطفاً لیستی که تسک باید در آن ساخته شود را انتخاب کنید:", InlineKeyboardMarkup(keyboard))
@@ -446,7 +505,10 @@ async def skip_due_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_for_assignee(update, context)
 
 async def ask_for_assignee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID)
+    user_id = str(update.effective_user.id)
+    user_query = [Query.equal("telegram_id", [user_id])]
+    users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID, user_query)
+
     keyboard = [[InlineKeyboardButton(user['username'], callback_data=f"select_user_{user['clickup_user_id']}")] for user in users]
     keyboard.append([InlineKeyboardButton("↪️ بازگشت به تاریخ پایان", callback_data="back_to_due_date"), InlineKeyboardButton("عبور ➡️", callback_data="select_user_skip")])
     await _send_or_edit(update, "مسئول انجام تسک را انتخاب کنید:", InlineKeyboardMarkup(keyboard))
@@ -474,7 +536,7 @@ async def assignee_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, task_data = await asyncio.to_thread(create_call)
 
     if success and (task_id := task_data.get('id')):
-        sync_call = partial(clickup_api.sync_single_task_from_clickup, task_id, token=token)
+        sync_call = partial(clickup_api.sync_single_task_from_clickup, task_id, token=token, telegram_id=user_id_str)
         synced_task = await asyncio.to_thread(sync_call)
         if synced_task:
             await render_task_view(query, task_id)
@@ -539,8 +601,9 @@ async def edit_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = '_'.join(query.data.split('_')[2:])
     context.user_data['edit_task_id'] = task_id
     task = await asyncio.to_thread(database.get_single_document, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', task_id)
-    if not task:
-        await _send_or_edit(update, "خطا: تسک مورد نظر یافت نشد.")
+    
+    if not task or task.get('telegram_id') != user_id:
+        await _send_or_edit(update, "خطا: تسک مورد نظر یافت نشد یا شما به آن دسترسی ندارید.")
         return ConversationHandler.END
     context.user_data['task'] = task
     return await show_edit_menu(query, context)
@@ -570,7 +633,8 @@ async def edit_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard = [[InlineKeyboardButton(p_name, callback_data=f"edit_value_{p_val}")] for p_name, p_val in [("فوری",1), ("بالا",2), ("متوسط",3), ("پایین",4), ("حذف",0)]]
         prompt_text = f"اولویت فعلی: *{task.get('priority', 'N/A')}*\n\nاولویت جدید را انتخاب کنید:"
     elif field_to_edit == 'assignees':
-        users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID)
+        user_query = [Query.equal("telegram_id", [user_id])]
+        users = await asyncio.to_thread(database.get_documents, config.APPWRITE_DATABASE_ID, config.CLICKUP_USERS_COLLECTION_ID, user_query)
         keyboard = [[InlineKeyboardButton(u['username'], callback_data=f"edit_value_{u['clickup_user_id']}")] for u in users]
         prompt_text = "مسئول جدید را انتخاب کنید:"
 
@@ -598,7 +662,7 @@ async def process_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, new_v
     success, response_data = await asyncio.to_thread(update_call)
     
     if success:
-        sync_call = partial(clickup_api.sync_single_task_from_clickup, task_id, token=token)
+        sync_call = partial(clickup_api.sync_single_task_from_clickup, task_id, token=token, telegram_id=user_id)
         await asyncio.to_thread(sync_call)
         await render_task_view(update, task_id)
         context.user_data.clear()
