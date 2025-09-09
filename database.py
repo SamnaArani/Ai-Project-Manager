@@ -25,55 +25,80 @@ def get_db_client():
         )
     return _client
 
-async def _ensure_attribute(db, db_id, coll_id, existing_keys, attr_key, attr_type, size=None, required=False):
+async def _ensure_attribute(db, db_id, coll_id, existing_keys, attr_key, attr_type, size=None, required=False, default=None):
     """تابع کمکی برای ساخت اتریبیوت در صورت عدم وجود."""
     if attr_key in existing_keys:
         return
     try:
-        logger.info(f"Attribute '{attr_key}' not found. Creating it...")
+        logger.info(f"Attribute '{attr_key}' not found in '{coll_id}'. Creating it...")
         if attr_type == 'string':
-            db.create_string_attribute(db_id, coll_id, key=attr_key, size=size, required=required)
+            db.create_string_attribute(db_id, coll_id, key=attr_key, size=size, required=required, default=default)
         elif attr_type == 'integer':
-            db.create_integer_attribute(db_id, coll_id, key=attr_key, required=required)
+            db.create_integer_attribute(db_id, coll_id, key=attr_key, required=required, default=default)
         elif attr_type == 'boolean':
-            db.create_boolean_attribute(db_id, coll_id, key=attr_key, required=required)
+            db.create_boolean_attribute(db_id, coll_id, key=attr_key, required=required, default=default)
+        elif attr_type == 'datetime':
+            db.create_datetime_attribute(db_id, coll_id, key=attr_key, required=required, default=default)
         
         logger.info(f"Attribute '{attr_key}' created. Waiting for it to become available...")
-        await asyncio.sleep(2)  # زمان دادن به Appwrite برای پردازش
+        await asyncio.sleep(2)
     except AppwriteException as e:
-        if e.code == 409:  # Conflict
+        if e.code == 409:
             logger.warning(f"Attribute '{attr_key}' already exists. Skipping.")
         else:
             logger.error(f"Failed to create attribute '{attr_key}': {e}")
+            raise
 
 async def setup_database_schemas():
     """ساختار دیتابیس را بررسی و در صورت نیاز، کالکشن‌ها و اتریبیوت‌ها را ایجاد می‌کند."""
     db = Databases(get_db_client())
     db_id = config.APPWRITE_DATABASE_ID
     
-    # --- بررسی و ساخت کالکشن کاربران ربات ---
+    collections_to_check = {
+        config.SPACES_COLLECTION_ID: "Spaces",
+        config.FOLDERS_COLLECTION_ID: "Folders",
+        config.LISTS_COLLECTION_ID: "Lists",
+        config.TASKS_COLLECTION_ID: "Tasks",
+        config.CLICKUP_USERS_COLLECTION_ID: "ClickUp Users",
+        config.BOT_USERS_COLLECTION_ID: "Bot Users"
+    }
+
+    # اطمینان از وجود اتریبیوت telegram_id در کالکشن‌های کلیک‌اپ
+    for coll_id, coll_name in collections_to_check.items():
+        if coll_id == config.BOT_USERS_COLLECTION_ID: continue # این کالکشن ساختار متفاوتی دارد
+        try:
+            collection = db.get_collection(db_id, coll_id)
+            existing_attrs = {attr['key'] for attr in collection['attributes']}
+            await _ensure_attribute(db, db_id, coll_id, existing_attrs, "telegram_id", 'string', 128, required=True)
+        except AppwriteException as e:
+            if e.code == 404: logger.warning(f"کالکشن '{coll_name}' یافت نشد. لطفاً از وجود آن مطمئن شوید.")
+            else: logger.error(f"خطا در بررسی کالکشن '{coll_name}': {e}")
+
+    # بررسی و ساخت کالکشن کاربران ربات
     try:
-        db.get_collection(db_id, config.BOT_USERS_COLLECTION_ID)
+        collection = db.get_collection(db_id, config.BOT_USERS_COLLECTION_ID)
+        existing_attrs = {attr['key'] for attr in collection['attributes']}
+        await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, existing_attrs, "created_at", 'datetime', required=False)
     except AppwriteException as e:
         if e.code == 404:
             logger.info("کالکشن 'bot_users' یافت نشد. در حال ایجاد...")
             db.create_collection(db_id, config.BOT_USERS_COLLECTION_ID, "Bot Users", permissions=['read("any")', 'create("any")', 'update("any")'])
-            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, [], "telegram_id", 'string', 128, True)
-            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, [], "clickup_token", 'string', 2048, False)
-            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, [], "is_active", 'boolean', required=True)
+            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, {}, "telegram_id", 'string', 128, required=True)
+            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, {}, "clickup_token", 'string', 2048, required=False)
+            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, {}, "is_active", 'boolean', required=True, default=False)
+            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, {}, "is_admin", 'boolean', required=True, default=False)
+            await _ensure_attribute(db, db_id, config.BOT_USERS_COLLECTION_ID, {}, "created_at", 'datetime', required=False)
             logger.info("کالکشن 'bot_users' و اتریبیوت‌های آن با موفقیت ایجاد شد.")
 
-    # --- بررسی و ساخت اتریبیوت‌های کالکشن تسک‌ها ---
+    # [FIX] اطمینان از اینکه folder_id در کالکشن لیست‌ها اختیاری است
     try:
-        tasks_collection = db.get_collection(db_id, config.TASKS_COLLECTION_ID)
-        existing_attributes = {attr['key'] for attr in tasks_collection['attributes']}
-        
-        await _ensure_attribute(db, db_id, config.TASKS_COLLECTION_ID, existing_attributes, "start_date", 'integer', required=False)
-        await _ensure_attribute(db, db_id, config.TASKS_COLLECTION_ID, existing_attributes, "due_date", 'integer', required=False)
-        await _ensure_attribute(db, db_id, config.TASKS_COLLECTION_ID, existing_attributes, "assignee_name", 'string', 255, required=False)
-
+        collection = db.get_collection(db_id, config.LISTS_COLLECTION_ID)
+        existing_attrs = {attr['key'] for attr in collection['attributes']}
+        # اطمینان حاصل کنید که این اتریبیوت به عنوان اختیاری ساخته می‌شود
+        await _ensure_attribute(db, db_id, config.LISTS_COLLECTION_ID, existing_attrs, "folder_id", 'string', 255, required=False)
     except AppwriteException as e:
-        logger.error(f"خطا در بررسی کالکشن تسک‌ها: {e}. لطفاً از وجود این کالکشن در Appwrite مطمئن شوید.")
+         logger.error(f"خطا در بررسی کالکشن لیست‌ها: {e}")
+
 
 def create_document(database_id, collection_id, data):
     try:
@@ -87,7 +112,7 @@ def get_documents(database_id, collection_id, queries=None):
     try:
         db = Databases(get_db_client())
         queries = queries or []
-        queries.append(Query.limit(100))
+        queries.append(Query.limit(500)) # افزایش محدودیت برای دریافت آیتم‌های بیشتر
         return db.list_documents(database_id, collection_id, queries=queries).get('documents', [])
     except AppwriteException as e:
         logger.error(f"خطای Appwrite در دریافت اسناد از کالکشن {collection_id}: {e}")
@@ -105,11 +130,17 @@ def get_single_document(database_id, collection_id, key, value):
 def upsert_document(database_id, collection_id, query_key, query_value, data):
     try:
         db = Databases(get_db_client())
+        # برای upsert کردن بر اساس یک کلید مشخص، باید ابتدا سند موجود را پیدا کنیم
         existing_doc = get_single_document(database_id, collection_id, query_key, str(query_value))
+        
         if existing_doc:
+            # اگر سند موجود بود، آن را آپدیت می‌کنیم
             return db.update_document(database_id, collection_id, existing_doc['$id'], data)
         else:
-            if query_key not in data: data[query_key] = query_value
+            # در غیر این صورت، سند جدیدی می‌سازیم
+            # اطمینان حاصل می‌کنیم که کلید کوئری در دیتای ورودی وجود دارد
+            if query_key not in data:
+                data[query_key] = query_value
             return db.create_document(database_id, collection_id, ID.unique(), data)
     except AppwriteException as e:
         logger.error(f"خطای Appwrite در ذخیره سند در کالکشن {collection_id}: {e.message}")
