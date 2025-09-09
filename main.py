@@ -7,6 +7,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ConversationHandler,
+    CommandHandler
 )
 from telegram import Update
 
@@ -24,9 +25,12 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-    # کاهش لاگ‌های اضافی از کتابخانه‌ها
-    for logger_name in ["httpx", "telegram", "appwrite", "urllib3"]:
+    # [FIX] کاهش لاگ‌های اضافی و تکراری از کتابخانه‌ها برای خوانایی بیشتر
+    for logger_name in ["httpx", "telegram", "urllib3"]:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+    # Appwrite warnings are very noisy, so we set it to ERROR
+    logging.getLogger("appwrite").setLevel(logging.ERROR)
+
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,7 @@ async def run_bot() -> None:
     application.add_handler(create_conv_handler, group=1)
     application.add_handler(edit_conv_handler, group=1)
 
+    application.add_handler(CommandHandler("resync", standard_handlers.resync_command), group=1)
     application.add_handler(MessageHandler(filters.Regex('^🔍 مرور پروژه‌ها$'), standard_handlers.browse_projects_entry), group=1)
     
     application.add_handler(CallbackQueryHandler(standard_handlers.button_handler), group=1)
