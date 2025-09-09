@@ -33,6 +33,7 @@ async def execute_plan(plan: Dict[str, Any], user_input: str, update: Update, co
     """
     نقشه را به صورت هوشمند اجرا می‌کند و به طور خودکار آبجکت‌های تلگرام را در صورت نیاز پاس می‌دهد.
     """
+    tool_name = "unknown"
     try:
         if not plan or 'steps' not in plan or not plan['steps']:
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=placeholder_message_id, text="متاسفانه نقشه‌ای برای اجرا دریافت نشد.")
@@ -101,12 +102,18 @@ def log_chat_to_db(user_id: str, user_name: str, user_message: str, bot_response
 
 async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    user_input = update.message.text
+    
+    # [FIX] Prevent processing of ClickUp tokens that might leak from ConversationHandler
+    if user_input.startswith('pk_') and len(user_input) > 20:
+        logger.warning("ورودی شبیه به توکن ClickUp است و توسط AI handler نادیده گرفته شد.")
+        return
+
     clickup_token = await standard_handlers._get_user_token(user_id, update, context)
     if not clickup_token:
         logger.warning(f"AI handler: User {user_id} is not authenticated. Aborting.")
         return
 
-    user_input = update.message.text
     user_name = update.message.from_user.username or "Unknown"
     
     placeholder_message = await context.bot.send_message(chat_id=update.effective_chat.id, text="در حال پردازش درخواست شما... ⏳")
@@ -190,4 +197,3 @@ async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.critical(f"خطای غیرمنتظره در پردازش هوشمند: {e}", exc_info=True)
         await placeholder_message.edit_text(f"🚨 یک خطای غیرمنتظره رخ داد: {str(e)}")
         log_chat_to_db(user_id, user_name, user_input, str(e), False, str(e))
-
