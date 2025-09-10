@@ -41,13 +41,13 @@ async def _ensure_attribute(db, db_id, coll_id, existing_keys, attr_key, attr_ty
             db.create_datetime_attribute(db_id, coll_id, key=attr_key, required=required, default=default, array=array)
         
         logger.info(f"Attribute '{attr_key}' created. Waiting for it to become available...")
-        await asyncio.sleep(2)  # زمان دادن به Appwrite برای پردازش
+        await asyncio.sleep(2)
     except AppwriteException as e:
-        if e.code == 409:  # Conflict
+        if e.code == 409:
             logger.warning(f"Attribute '{attr_key}' already exists. Skipping.")
         else:
             logger.error(f"Failed to create attribute '{attr_key}': {e.message}")
-            raise # Re-raise to stop execution if schema setup fails
+            raise
 
 async def setup_database_schemas():
     """ساختار دیتابیس را بررسی و در صورت نیاز، کالکشن‌ها و اتریبیوت‌ها را ایجاد می‌کند."""
@@ -64,6 +64,7 @@ async def setup_database_schemas():
                 ("usage_limit", 'integer', None, False, 0), ("used_count", 'integer', None, False, 0),
                 ("expiry_date", 'datetime', None, False), ("clickup_user_id", 'string', 128, False),
                 ("clickup_username", 'string', 255, False), ("clickup_email", 'string', 255, False),
+                ("package_activation_date", 'datetime', None, False), # New field for activation date
             ]
         },
         config.CLICKUP_USERS_COLLECTION_ID: {
@@ -133,7 +134,6 @@ def create_document(database_id, collection_id, data):
 def get_documents(database_id, collection_id, queries=None):
     try:
         db = Databases(get_db_client())
-        # Appwrite's default limit is 25, let's increase it for practical use
         queries = queries or []
         queries.append(Query.limit(500)) 
         return db.list_documents(database_id, collection_id, queries=queries).get('documents', [])
@@ -150,17 +150,24 @@ def get_single_document(database_id, collection_id, key, value):
         logger.error(f"خطای Appwrite در دریافت سند با {key}={value}: {e.message}")
         return None
 
+def get_single_document_by_id(database_id, collection_id, document_id):
+    """یک سند را با شناسه منحصر به فرد Appwrite ($id) آن دریافت می‌کند."""
+    try:
+        db = Databases(get_db_client())
+        return db.get_document(database_id, collection_id, document_id)
+    except AppwriteException as e:
+        logger.error(f"خطای Appwrite در دریافت سند با ID={document_id}: {e.message}")
+        return None
+
 def upsert_document(database_id, collection_id, query_key, query_value, data):
     try:
         db = Databases(get_db_client())
-        # Ensure query_value is a string for lookup
         str_query_value = str(query_value)
         existing_doc = get_single_document(database_id, collection_id, query_key, str_query_value)
         
         if existing_doc:
             return db.update_document(database_id, collection_id, existing_doc['$id'], data)
         else:
-            # Ensure the query key-value pair is in the data for creation
             if query_key not in data:
                 data[query_key] = query_value
             return db.create_document(database_id, collection_id, ID.unique(), data)
