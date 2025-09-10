@@ -61,10 +61,10 @@ async def view_package_details(update: Update, context: ContextTypes.DEFAULT_TYP
     toggle_text = "غیرفعال کردن" if pkg.get('is_active') else "فعال کردن"
 
     text = (f"📦 *جزئیات پکیج: {pkg['package_name']}*\n\n"
-            f"▫️ *قیمت:* {price}\n"
-            f"▫️ *محدودیت AI:* {ai_limit}\n"
-            f"▫️ *وضعیت:* {status_text}\n"
-            f"▫️ *تعداد کاربران فعال:* {user_count} نفر\n\n"
+            f"💰 *قیمت:* {price}\n"
+            f"🤖 *محدودیت AI:* {ai_limit}\n"
+            f"📊 *وضعیت:* {status_text}\n"
+            f"👥 *تعداد کاربران فعال:* {user_count} نفر\n\n"
             f"📜 *توضیحات:*\n{pkg.get('package_description', 'ندارد')}")
     keyboard = [[InlineKeyboardButton("✏️ ویرایش", callback_data=f"admin_pkg_edit_{package_id}"),
                  InlineKeyboardButton(f"🔄 {toggle_text}", callback_data=f"admin_pkg_toggle_{package_id}"),
