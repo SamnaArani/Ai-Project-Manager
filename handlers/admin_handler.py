@@ -33,7 +33,7 @@ async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📦 مدیریت پکیج‌ها":
         await admin_package_handler.manage_packages_entry(update, context)
     elif text == "📊 مدیریت کاربران":
-        await admin_user_handler.manage_users_entry(update, context) # Will be implemented next
+        await admin_user_handler.manage_users_entry(update, context) 
     elif text == "📈 گزارشات":
         await update.message.reply_text("شما وارد بخش گزارشات شدید. (در حال توسعه)")
     elif text == "⚙️ تنظیمات ربات":
