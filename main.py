@@ -21,7 +21,7 @@ from handlers import (
     admin_handler,
     admin_package_handler,
     admin_payment_handler,
-    admin_user_handler, # Import the new handler
+    admin_user_handler, 
 )
 from webhook_server import run_webhook_server
 import database
@@ -55,10 +55,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     if isinstance(update, Update):
         for conv_handler in active_conversations:
-            # This is a simplified check. A more robust solution might be needed
-            # if conversations get stuck, but it helps prevent further errors.
             if conv_handler.check_update(update):
-                # Try to end the conversation gracefully
                 await conv_handler.handle_update(update, context.application, check_result=None, context=context)
                 break
 
@@ -103,6 +100,7 @@ async def run_bot() -> None:
     application.add_handler(CallbackQueryHandler(browse_handler.button_handler, pattern=r'^(browse_|view_|refresh_|delete_|confirm_delete_)'), group=1)
     application.add_handler(CallbackQueryHandler(admin_package_handler.admin_package_button_handler, pattern=r'^admin_pkg_'), group=1)
     application.add_handler(CallbackQueryHandler(admin_payment_handler.admin_payment_button_handler, pattern=r'^admin_payment_'), group=1)
+    application.add_handler(CallbackQueryHandler(admin_user_handler.admin_user_button_handler, pattern=r'^admin_user_'), group=1)
     
     # --- AI Handler (Last Priority) ---
     ai_text_filter = filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^(🔍 مرور پروژه‌ها|➕ ساخت تسک جدید)$') & ~admin_menu_filter
