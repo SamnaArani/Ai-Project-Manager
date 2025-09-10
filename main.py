@@ -7,12 +7,19 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ConversationHandler,
-    CommandHandler
+    CommandHandler,
 )
 from telegram import Update
 
 import config
-from handlers import standard_handlers, ai_handlers
+from handlers import (
+    ai_handlers,
+    auth_handler,
+    browse_handler,
+    task_handler,
+    admin_handler,
+    common,
+)
 from webhook_server import run_webhook_server
 import database
 
@@ -25,12 +32,9 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-    # [FIX] کاهش لاگ‌های اضافی و تکراری از کتابخانه‌ها برای خوانایی بیشتر
-    for logger_name in ["httpx", "telegram", "urllib3"]:
+    # کاهش لاگ‌های اضافی از کتابخانه‌ها
+    for logger_name in ["httpx", "telegram", "urllib3", "appwrite"]:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
-    # Appwrite warnings are very noisy, so we set it to ERROR
-    logging.getLogger("appwrite").setLevel(logging.ERROR)
-
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                 context.user_data.clear()
             if context.chat_data:
                 context.chat_data.clear()
-            await update.effective_message.reply_text("⚠️ متأسفم، یک خطای غیرمنتظره رخ داد. لطفاً با ارسال /start دوباره تلاش کنید.")
+            
+            # برای جلوگیری از خطای "Message is not modified"
+            error_message = f"⚠️ متأسفم، یک خطای غیرمنتظره رخ داد.\n\n`{context.error}`\n\nلطفاً با ارسال /start دوباره تلاش کنید."
+            if update.callback_query:
+                await update.callback_query.message.edit_text(error_message)
+            else:
+                await update.effective_message.reply_text(error_message)
+
         except Exception as e:
             logger.error(f"خطای ناشناخته هنگام ارسال پیام خطا به کاربر: {e}", exc_info=True)
 
@@ -51,27 +62,33 @@ async def run_bot() -> None:
     """ربات تلگرام را راه‌اندازی و اجرا می‌کند."""
     application = Application.builder().token(config.BOT_TOKEN).build()
 
-    # --- ثبت Handler‌ها با اولویت‌بندی صحیح ---
+    # --- ثبت Handler‌ها ---
     
-    # گروه 0: مکالمه احراز هویت (بالاترین اولویت)
-    auth_handler = standard_handlers.get_auth_handler()
-    application.add_handler(auth_handler, group=0)
-
-    # گروه 1: سایر مکالمات و دستورات (برای کاربران احراز هویت شده)
-    create_conv_handler = standard_handlers.get_create_task_conv_handler()
-    edit_conv_handler = standard_handlers.get_edit_task_conv_handler()
-    application.add_handler(create_conv_handler, group=1)
-    application.add_handler(edit_conv_handler, group=1)
-
-    application.add_handler(CommandHandler("resync", standard_handlers.resync_command), group=1)
-    application.add_handler(MessageHandler(filters.Regex('^🔍 مرور پروژه‌ها$'), standard_handlers.browse_projects_entry), group=1)
+    # مکالمات (بالاترین اولویت)
+    application.add_handler(auth_handler.get_auth_handler())
+    application.add_handler(task_handler.get_create_task_conv_handler())
+    application.add_handler(task_handler.get_edit_task_conv_handler())
+    application.add_handler(admin_handler.get_new_package_conv_handler())
+    application.add_handler(admin_handler.get_edit_package_conv_handler())
     
-    application.add_handler(CallbackQueryHandler(standard_handlers.button_handler), group=1)
-    
-    # هوش مصنوعی (آخرین اولویت برای پیام‌های متنی)
-    ai_text_filter = filters.TEXT & ~filters.COMMAND & ~filters.Regex('^🔍 مرور پروژه‌ها$') & ~filters.Regex('^➕ ساخت تسک جدید$')
-    application.add_handler(MessageHandler(ai_text_filter, ai_handlers.ai_handler_entry), group=1)
+    # دستورات ادمین
+    application.add_handler(CommandHandler("resync", admin_handler.resync_command))
+    application.add_handler(CommandHandler("reviewpayments", admin_handler.review_payments_command))
 
+    # دکمه‌های شیشه‌ای (CallbackQueryHandlers)
+    application.add_handler(CallbackQueryHandler(browse_handler.button_handler, pattern='^(browse_|view_|refresh_|delete_|confirm_delete_)'))
+    application.add_handler(CallbackQueryHandler(admin_handler.admin_package_button_handler, pattern='^admin_pkg_'))
+    application.add_handler(CallbackQueryHandler(admin_handler.admin_payment_button_handler, pattern='^admin_payment_'))
+    
+    # پیام‌های متنی (کمترین اولویت)
+    application.add_handler(MessageHandler(filters.Regex('^🔍 مرور پروژه‌ها$'), browse_handler.browse_projects_entry))
+    application.add_handler(MessageHandler(filters.Regex('^➕ ساخت تسک جدید$'), task_handler.new_task_entry))
+    application.add_handler(MessageHandler(filters.Regex('^(📊 مدیریت کاربران|📦 مدیریت پکیج‌ها|📈 گزارشات|⚙️ تنظیمات ربات)$'), admin_handler.admin_panel_entry))
+
+    # هوش مصنوعی (آخرین اولویت برای پیام‌های متنی عمومی)
+    ai_text_filter = filters.TEXT & ~filters.COMMAND & ~filters.Regex('^(🔍 مرور پروژه‌ها|➕ ساخت تسک جدید|📊 مدیریت کاربران|📦 مدیریت پکیج‌ها|📈 گزارشات|⚙️ تنظیمات ربات)$')
+    application.add_handler(MessageHandler(ai_text_filter, ai_handlers.ai_handler_entry))
+    
     application.add_error_handler(error_handler)
 
     # اجرای ربات
