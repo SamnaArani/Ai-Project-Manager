@@ -2,6 +2,10 @@
 
 # --- بخش تنظیمات ---
 BOT_TOKEN = "7736071055:AAErrCcnpSBCETr_3BYX4Elrq-JfYj044Y0"
+# --- نام کاربری ادمین اصلی برای نمایش در پیام‌ها ---
+# !!! مهم: این نام کاربری را با آیدی تلگرام خودتان جایگزین کنید (بدون @)
+ADMIN_USERNAME = "saman_arani"
+
 
 # --- تنظیمات Appwrite ---
 APPWRITE_PROJECT_ID = '686db557001d532b78d4'
@@ -24,3 +28,4 @@ PAYMENT_REQUESTS_COLLECTION_ID = '68b94154001ce836a003'
 # --- تنظیمات هوش مصنوعی (Ollama) ---
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "orieg/gemma3-tools:1b"
+
