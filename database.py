@@ -58,13 +58,21 @@ async def setup_database_schemas():
         config.BOT_USERS_COLLECTION_ID: {
             "name": "Bot Users",
             "attributes": [
-                ("telegram_id", 'string', 128, True), ("clickup_token", 'string', 2048, False),
-                ("is_active", 'boolean', None, True, False), ("is_admin", 'boolean', None, True, False),
-                ("created_at", 'datetime', None, False), ("package_id", 'string', 128, False),
-                ("usage_limit", 'integer', None, False, 0), ("used_count", 'integer', None, False, 0),
-                ("expiry_date", 'datetime', None, False), ("clickup_user_id", 'string', 128, False),
-                ("clickup_username", 'string', 255, False), ("clickup_email", 'string', 255, False),
-                ("package_activation_date", 'datetime', None, False), # New field for activation date
+                ("telegram_id", 'string', 128, True), 
+                ("full_name", 'string', 255, False), # New field for user's full name
+                ("telegram_username", 'string', 255, False), # New field for user's Telegram username
+                ("clickup_token", 'string', 2048, False),
+                ("is_active", 'boolean', None, True, False), 
+                ("is_admin", 'boolean', None, True, False),
+                ("created_at", 'datetime', None, False), 
+                ("package_id", 'string', 128, False),
+                ("usage_limit", 'integer', None, False, 0), 
+                ("used_count", 'integer', None, False, 0),
+                ("expiry_date", 'datetime', None, False), 
+                ("clickup_user_id", 'string', 128, False),
+                ("clickup_username", 'string', 255, False), 
+                ("clickup_email", 'string', 255, False),
+                ("package_activation_date", 'datetime', None, False),
             ]
         },
         config.CLICKUP_USERS_COLLECTION_ID: {
