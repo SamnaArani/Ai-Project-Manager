@@ -75,7 +75,6 @@ async def user_message_received(update: Update, context: ContextTypes.DEFAULT_TY
         "✅ پیام شما با موفقیت ثبت شد. پس از بررسی توسط ادمین، پاسخ برای شما ارسال خواهد شد."
     )
 
-    # --- Live Notification for Admins ---
     admins = await asyncio.to_thread(
         database.get_documents,
         config.APPWRITE_DATABASE_ID,
@@ -96,7 +95,6 @@ async def user_message_received(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception as e:
             logger.error(f"Failed to send new message notification to admin {admin['telegram_id']}: {e}")
-        # Also refresh their main menu to update the counter
         await admin_panel_handler.show_admin_panel(admin['telegram_id'], context)
 
 
@@ -152,8 +150,8 @@ async def manage_messages_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def view_user_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id_override: str = None):
     """Displays all tickets from a specific user. Can be called from a message or callback query."""
-    query = update.callback_query
     user_id = ""
+    query = update.callback_query
 
     if user_id_override:
         user_id = user_id_override
@@ -208,14 +206,13 @@ async def view_single_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.edit_text("خطا: این پیام یافت نشد.")
         return ConversationHandler.END
 
-    # Mark as read upon viewing
     if ticket['status'] == 'unread':
         await asyncio.to_thread(
             database.upsert_document,
             config.APPWRITE_DATABASE_ID, config.SUPPORT_TICKETS_COLLECTION_ID,
             '$id', ticket_id, {'status': 'read'}
         )
-        ticket['status'] = 'read' # Update local copy
+        ticket['status'] = 'read'
 
     context.user_data['reply_ticket_id'] = ticket_id
     
@@ -244,7 +241,7 @@ async def view_single_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_reply_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receives, saves, and sends the admin's reply."""
     context.chat_data['conversation_handled'] = True
-    ticket_id = context.user_data.get('reply_ticket_id')
+    ticket_id = context.user_data.pop('reply_ticket_id', None)
     admin_reply_text = update.message.text
     
     if not ticket_id:
@@ -289,7 +286,6 @@ async def admin_reply_received(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Failed to send support reply to {user_telegram_id}: {e}")
         await update.message.reply_text("⚠️ پاسخ در سیستم ثبت شد، اما ارسال آن به کاربر ناموفق بود.")
         
-    context.user_data.clear()
     await view_user_tickets(update, context, user_id_override=user_telegram_id)
     return ConversationHandler.END
 
