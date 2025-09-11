@@ -4,8 +4,9 @@ import telegram
 import json
 import logging
 import inspect
-from typing import Dict, Any
-from datetime import datetime
+from typing import Dict, Any, Tuple
+from datetime import datetime, date, timezone
+from dateutil.parser import parse as dateutil_parse
 from langchain.memory import ConversationSummaryMemory
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -28,6 +29,77 @@ def get_memory(user_id: str) -> ConversationSummaryMemory:
     if user_id not in memories:
         memories[user_id] = ConversationSummaryMemory(llm=ChatOllama(model=config.OLLAMA_MODEL, base_url=config.OLLAMA_BASE_URL))
     return memories[user_id]
+
+# --- AI Access Control ---
+
+async def check_ai_access(user_id: str, request_type: str) -> Tuple[bool, str, dict, dict]:
+    """
+    Checks if a user has access to AI features based on their package.
+    Returns: (has_access, reason, user_doc, package_doc)
+    """
+    user_doc = await asyncio.to_thread(
+        database.get_single_document, config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id
+    )
+    if not user_doc or not user_doc.get('package_id'):
+        return False, "شما پکیج فعالی ندارید.", None, None
+
+    package_doc = await asyncio.to_thread(
+        database.get_single_document_by_id, config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, user_doc['package_id']
+    )
+    if not package_doc:
+        return False, "پکیج شما یافت نشد.", user_doc, None
+
+    # Check expiry
+    expiry_str = user_doc.get('package_expiry_date')
+    if expiry_str:
+        expiry_date = dateutil_parse(expiry_str).date()
+        if expiry_date < date.today():
+            return False, "اعتبار پکیج شما به پایان رسیده است.", user_doc, package_doc
+
+    # Check and reset daily counters
+    today_str = date.today().isoformat()
+    last_usage_str = user_doc.get('last_usage_date', "").split("T")[0]
+    if last_usage_str != today_str:
+        await asyncio.to_thread(
+            database.upsert_document,
+            config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id,
+            {'daily_chat_usage': 0, 'daily_command_usage': 0}
+        )
+        user_doc.update({'daily_chat_usage': 0, 'daily_command_usage': 0})
+    
+    # Check permissions and limits
+    if request_type == 'chat':
+        if not package_doc.get('allow_ai_chat'):
+            return False, "پکیج شما اجازه چت با هوش مصنوعی را نمی‌دهد.", user_doc, package_doc
+        if package_doc.get('daily_chat_limit', 0) > 0 and user_doc.get('daily_chat_usage', 0) >= package_doc['daily_chat_limit']:
+            return False, "محدودیت چت روزانه شما به پایان رسیده است.", user_doc, package_doc
+        if package_doc.get('monthly_chat_limit', 0) > 0 and user_doc.get('monthly_chat_usage', 0) >= package_doc['monthly_chat_limit']:
+            return False, "محدودیت چت ماهانه شما به پایان رسیده است.", user_doc, package_doc
+    
+    elif request_type == 'command':
+        if not package_doc.get('allow_ai_commands'):
+            return False, "پکیج شما اجازه استفاده از دستورات هوشمند را نمی‌دهد.", user_doc, package_doc
+        if package_doc.get('daily_command_limit', 0) > 0 and user_doc.get('daily_command_usage', 0) >= package_doc['daily_command_limit']:
+            return False, "محدودیت دستورات هوشمند روزانه شما به پایان رسیده است.", user_doc, package_doc
+        if package_doc.get('monthly_command_limit', 0) > 0 and user_doc.get('monthly_command_usage', 0) >= package_doc['monthly_command_limit']:
+            return False, "محدودیت دستورات هوشمند ماهانه شما به پایان رسیده است.", user_doc, package_doc
+
+    return True, "دسترسی مجاز است.", user_doc, package_doc
+
+async def increment_usage_counters(user_id: str, request_type: str, user_doc: dict):
+    """Increments the relevant usage counters for the user."""
+    update_data = {'last_usage_date': datetime.now(timezone.utc).isoformat()}
+    if request_type == 'chat':
+        update_data['daily_chat_usage'] = user_doc.get('daily_chat_usage', 0) + 1
+        update_data['monthly_chat_usage'] = user_doc.get('monthly_chat_usage', 0) + 1
+    elif request_type == 'command':
+        update_data['daily_command_usage'] = user_doc.get('daily_command_usage', 0) + 1
+        update_data['monthly_command_usage'] = user_doc.get('monthly_command_usage', 0) + 1
+    
+    await asyncio.to_thread(
+        database.upsert_document,
+        config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id, update_data
+    )
 
 async def execute_plan(plan: Dict[str, Any], user_input: str, update: Update, context: ContextTypes.DEFAULT_TYPE, placeholder_message_id: int) -> bool:
     """
@@ -57,34 +129,14 @@ async def execute_plan(plan: Dict[str, Any], user_input: str, update: Update, co
         if 'update' in sig.parameters: tool_args['update'] = update
         if 'context' in sig.parameters: tool_args['context'] = context
 
-        # اجرای ابزار برای تسک‌های چندگانه یا تکی
-        if 'task_names' in tool_args and isinstance(tool_args['task_names'], list):
-            final_message = ""
-            tasks_to_process = tool_args.pop('task_names')
-            logger.info(f"پردازش گروهی برای {len(tasks_to_process)} تسک آغاز شد.")
-            for task_name in tasks_to_process:
-                single_task_args = {**tool_args, 'task_name': task_name}
-                logger.info(f"  -> در حال پردازش تسک '{task_name}'...")
-                try:
-                    result = await tool_function(**single_task_args)
-                    if result:
-                        final_message += result.get('message', 'عملیات با موفقیت انجام شد.') + "\n\n"
-                        if result.get('url'): final_message += f"🔗 *لینک تسک:* {result['url']}\n\n"
-                        logger.info(f"  -->> عملیات روی تسک '{task_name}' موفق بود.")
-                except Exception as e:
-                    final_message += f"❌ *خطا در تسک «{task_name}»*: {str(e)}\n\n"
-            
+        result = await tool_function(**tool_args)
+        if result is not None:
+            final_message = result.get('message', 'عملیات با موفقیت انجام شد.')
+            if result.get('url'): final_message += f"\n\n🔗 *لینک تسک:* {result['url']}"
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=placeholder_message_id, text=final_message, parse_mode='Markdown')
-            logger.info("پردازش گروهی تسک‌ها به پایان رسید.")
+            logger.info(f"عملیات تکی با ابزار '{tool_name}' با موفقیت انجام شد.")
         else:
-            result = await tool_function(**tool_args)
-            if result is not None:
-                final_message = result.get('message', 'عملیات با موفقیت انجام شد.')
-                if result.get('url'): final_message += f"\n\n🔗 *لینک تسک:* {result['url']}"
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=placeholder_message_id, text=final_message, parse_mode='Markdown')
-                logger.info(f"عملیات تکی با ابزار '{tool_name}' با موفقیت انجام شد.")
-            else:
-                logger.info(f"ابزار تعاملی '{tool_name}' اجرا شد و منتظر ورودی کاربر است.")
+            logger.info(f"ابزار تعاملی '{tool_name}' اجرا شد و منتظر ورودی کاربر است.")
 
         return True
     
@@ -102,126 +154,82 @@ def log_chat_to_db(user_id: str, user_name: str, user_message: str, bot_response
 
 async def ai_handler_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    chat_id = update.effective_chat.id
     
-    # --- FLAG-BASED CONVERSATION CHECK ---
     if context.chat_data.pop('conversation_handled', False):
         logger.info(f"AI handler blocked for user {user_id} because the update was handled by a conversation.")
         return
         
-    # --- RELIABLE CONVERSATION CHECK ---
-    # This is the correct way for PTB v20+
     all_handlers = context.application.handlers
     for group in all_handlers.values():
         for handler in group:
             if isinstance(handler, ConversationHandler):
-                # We need to manually construct the key as it's not exposed
-                if handler.per_user:
-                    conv_key = (update.effective_chat.id, update.effective_user.id)
-                elif handler.per_chat:
-                    conv_key = (update.effective_chat.id, update.effective_chat.id)
-                else: # per message
-                    conv_key = (update.effective_message.message_id, update.effective_message.message_id)
-
-                if handler.states.get(conv_key) is not None:
+                if handler.check_update(update) and handler.current_state(update, context) is not None:
                     logger.info(f"AI handler blocked for user {user_id} because a conversation is active.")
                     return
-    # --- END CHECKS ---
 
-
-    # از ارسال پیام‌هایی که شبیه توکن هستند، جلوگیری می‌کنیم
     if update.message and update.message.text and update.message.text.startswith('pk_'):
         logger.info(f"Ignoring likely ClickUp token from user {user_id}.")
         return
         
-    clickup_token = await common.get_user_token(user_id, update, context, notify_user=False)
-    if not clickup_token:
-        logger.info(f"AI handler: User {user_id} does not have a token. Silently aborting AI processing.")
-        return
-
-    user_input = update.message.text
-    user_name = update.message.from_user.username or "Unknown"
-    
     placeholder_message = await context.bot.send_message(chat_id=update.effective_chat.id, text="در حال پردازش درخواست شما... ⏳")
     
+    user_input = update.message.text
+    user_name = update.message.from_user.username or "Unknown"
     logger.info(f"درخواست هوش مصنوعی جدید از '{user_name}' ({user_id}): '{user_input}'")
     
     memory = get_memory(user_id)
+    history = memory.chat_memory.messages
     
-    conversation_state = context.chat_data.get('conversation_state')
+    clickup_token = await common.get_user_token(user_id, update, context, notify_user=False)
     
-    if conversation_state == 'awaiting_delete_confirmation':
-        logger.info(f"کاربر در وضعیت 'awaiting_delete_confirmation' است. پردازش پاسخ...")
+    # Handle delete confirmation which is a special state outside of formal conversations
+    if context.chat_data.get('conversation_state') == 'awaiting_delete_confirmation':
         pending_deletion_info = context.chat_data.pop('pending_deletion', None)
         context.chat_data.pop('conversation_state', None)
         if not pending_deletion_info:
-             logger.error("خطای داخلی: pending_deletion_info در حالی که در وضعیت تایید حذف بود، یافت نشد.")
-             await placeholder_message.edit_text("خطای داخلی: اطلاعات تسک برای حذف یافت نشد.")
-             return
-        
+            await placeholder_message.edit_text("خطای داخلی: اطلاعات تسک برای حذف یافت نشد.")
+            return
         if user_input.lower() in ['بله', 'آره', 'yes', 'y']:
-            logger.info("کاربر حذف را تایید کرد.")
-            task_id, task_name = pending_deletion_info['task_id'], pending_deletion_info['task_name']
-            await placeholder_message.edit_text(f"در حال حذف تسک '{task_name}'...")
-            
-            if await asyncio.to_thread(clickup_api.delete_task_in_clickup, task_id, clickup_token):
-                logger.info(f"تسک '{task_name}' ({task_id}) با موفقیت از ClickUp حذف شد.")
-                db_deleted = await asyncio.to_thread(
-                    database.delete_document_by_clickup_id, 
-                    config.APPWRITE_DATABASE_ID, 
-                    config.TASKS_COLLECTION_ID, 
-                    'clickup_task_id', 
-                    task_id
-                )
-                if db_deleted:
-                    logger.info(f"تسک '{task_name}' ({task_id}) با موفقیت از دیتابیس محلی حذف شد.")
-                    await placeholder_message.edit_text(f"✅ تسک '{task_name}' با موفقیت حذف شد.")
-                else:
-                    logger.warning(f"تسک '{task_name}' ({task_id}) از دیتابیس محلی حذف نشد (احتمالا از قبل وجود نداشت).")
-                    await placeholder_message.edit_text(f"⚠️ تسک از ClickUp حذف شد، اما از دیتابیس محلی حذف نشد.")
+            if await asyncio.to_thread(clickup_api.delete_task_in_clickup, pending_deletion_info['task_id'], clickup_token):
+                await asyncio.to_thread(database.delete_document_by_clickup_id, config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, 'clickup_task_id', pending_deletion_info['task_id'])
+                await placeholder_message.edit_text(f"✅ تسک '{pending_deletion_info['task_name']}' با موفقیت حذف شد.")
             else:
-                logger.error(f"حذف تسک '{task_name}' ({task_id}) از ClickUp ناموفق بود.")
                 await placeholder_message.edit_text("❌ حذف تسک از ClickUp ناموفق بود.")
         else:
-            logger.info("کاربر حذف را لغو کرد.")
-            await placeholder_message.edit_text(f"عملیات حذف تسک '{pending_deletion_info.get('task_name', 'مورد نظر')}' لغو شد.")
+            await placeholder_message.edit_text(f"عملیات حذف تسک '{pending_deletion_info['task_name']}' لغو شد.")
         return
 
-    history = memory.chat_memory.messages
+    # AI Routing
     await update.message.chat.send_action(action='typing')
     routing_messages = [SystemMessage(content=prompts.TOOL_ROUTER_PROMPT)] + history + [HumanMessage(content=user_input)]
-
     llm_router = ChatOllama(model=config.OLLAMA_MODEL, base_url=config.OLLAMA_BASE_URL, format="json", temperature=0)
+    
     try:
         response = await llm_router.ainvoke(routing_messages)
-        logger.info(f"پاسخ خام از مسیریاب LLM:\n{response.content}")
         plan = json.loads(response.content)
         tool_name = plan.get('steps', [{}])[0].get('tool_name', 'no_op')
-        logger.info(f"ابزار انتخاب شده توسط مسیریاب: '{tool_name}'")
         
+        request_type = 'chat' if tool_name == 'no_op' else 'command'
+        has_access, reason, user_doc, _ = await check_ai_access(user_id, request_type)
+
+        if not has_access:
+            await placeholder_message.edit_text(f"❌ {reason}")
+            return
+            
         if tool_name == 'no_op':
-            logger.info("مسیریاب 'no_op' را انتخاب کرد. تولید پاسخ محاوره‌ای...")
-            chat_prompt_text = prompts.CHAT_PROMPT.format(user_input=user_input)
             llm_chat = ChatOllama(model=config.OLLAMA_MODEL, base_url=config.OLLAMA_BASE_URL, temperature=0.7)
-            chat_response = await llm_chat.ainvoke([SystemMessage(content=chat_prompt_text)] + history + [HumanMessage(content=user_input)])
-            logger.info(f"پاسخ نهایی محاوره‌ای:\n{chat_response.content}")
+            chat_response = await llm_chat.ainvoke([SystemMessage(content=prompts.CHAT_PROMPT)] + history + [HumanMessage(content=user_input)])
             await placeholder_message.edit_text(chat_response.content)
             memory.save_context({"input": user_input}, {"output": chat_response.content})
+            await increment_usage_counters(user_id, 'chat', user_doc)
             log_chat_to_db(user_id, user_name, user_input, chat_response.content, True)
         else:
-            success = await execute_plan(plan, user_input, update, context, placeholder_message.message_id)
-            if tool_name not in ['confirm_and_delete_task', 'ask_user']:
-                 memory.save_context({"input": user_input}, {"output": response.content})
-                 log_chat_to_db(user_id, user_name, user_input, response.content, success)
+            await execute_plan(plan, user_input, update, context, placeholder_message.message_id)
+            await increment_usage_counters(user_id, 'command', user_doc)
+            log_chat_to_db(user_id, user_name, user_input, json.dumps(plan), True)
 
-    except ConnectError:
-        await placeholder_message.edit_text("❌ امکان اتصال به سرویس هوش مصنوعی وجود ندارد.")
-        log_chat_to_db(user_id, user_name, user_input, "ConnectError to Ollama", False, "Ollama not running")
-    except json.JSONDecodeError:
-        await placeholder_message.edit_text("🚨 خطا: پاسخ نامعتبر از هوش مصنوعی دریافت شد.")
-        log_chat_to_db(user_id, user_name, user_input, "Invalid JSON Response", False, "JSONDecodeError")
     except Exception as e:
         logger.critical(f"خطای غیرمنتظره در پردازش هوشمند: {e}", exc_info=True)
-        await placeholder_message.edit_text(f"🚨 یک خطای غیرمنتظره رخ داد: {str(e)}")
+        await placeholder_message.edit_text(f"🚨 یک خطای غیرمنتظره رخ داد.")
         log_chat_to_db(user_id, user_name, user_input, str(e), False, str(e))
 
