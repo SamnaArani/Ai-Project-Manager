@@ -59,8 +59,8 @@ async def setup_database_schemas():
             "name": "Bot Users",
             "attributes": [
                 ("telegram_id", 'string', 128, True), 
-                ("full_name", 'string', 255, False), # New field for user's full name
-                ("telegram_username", 'string', 255, False), # New field for user's Telegram username
+                ("full_name", 'string', 255, False),
+                ("telegram_username", 'string', 255, False),
                 ("clickup_token", 'string', 2048, False),
                 ("is_active", 'boolean', None, True, False), 
                 ("is_admin", 'boolean', None, True, False),
@@ -111,6 +111,19 @@ async def setup_database_schemas():
                 ("status", 'string', 50, False, "pending"),
                 ("request_date", 'datetime', None, False), ("review_date", 'datetime', None, False),
                 ("admin_notes", 'string', 1024, False),
+            ]
+        },
+        config.SUPPORT_TICKETS_COLLECTION_ID: {
+            "name": "Support Tickets",
+            "attributes": [
+                ("telegram_id", 'string', 128, True),
+                ("telegram_username", 'string', 255, False),
+                ("full_name", 'string', 255, False),
+                ("user_message", 'string', 4096, True),
+                ("admin_reply", 'string', 4096, False),
+                ("status", 'string', 50, False, "unread"), # FIX: Cannot be required and have a default
+                ("created_at", 'datetime', None, True),
+                ("replied_at", 'datetime', None, False),
             ]
         }
     }
