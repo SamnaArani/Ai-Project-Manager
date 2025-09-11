@@ -11,6 +11,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from appwrite.query import Query
 import config
 import database
 import clickup_api
@@ -31,7 +32,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         database.get_single_document, config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id
     )
     
-    # --- Blocked User Check at Start ---
     if user_doc and not user_doc.get('is_active', True):
         await update.message.reply_text(
             f"❌ حساب کاربری شما مسدود است.\n"
@@ -39,21 +39,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ConversationHandler.END
 
-    # --- Update or Create User Profile with latest Telegram data ---
     full_name = user_info.full_name
     telegram_username = user_info.username or ""
     
-    user_data_payload = {
-        'telegram_id': user_id,
-        'full_name': full_name,
-        'telegram_username': telegram_username,
-    }
-    
+    user_data_payload = { 'telegram_id': user_id, 'full_name': full_name, 'telegram_username': telegram_username }
     if not user_doc:
         user_data_payload.update({
-            'is_active': True, # New users are active by default until changed by admin
-            'is_admin': False,
-            'created_at': datetime.now(timezone.utc).isoformat()
+            'is_active': True, 'is_admin': False, 'created_at': datetime.now(timezone.utc).isoformat()
         })
     
     await asyncio.to_thread(
@@ -62,22 +54,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         'telegram_id', user_id, user_data_payload
     )
 
-    # Re-fetch the doc after potential creation
     if not user_doc:
          user_doc = await asyncio.to_thread(
-            database.get_single_document, config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLlection_ID, 'telegram_id', user_id
+            database.get_single_document, config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID, 'telegram_id', user_id
         )
 
-    # --- Direct user based on their status ---
     if user_doc and user_doc.get('is_admin'):
         await admin_handler.start_for_admin(update, context)
         return ConversationHandler.END
 
-    if user_doc and user_doc.get('clickup_token') and user_doc.get('is_active'):
+    if user_doc and user_doc.get('clickup_token') and user_doc.get('package_id'):
         await show_main_menu(update, "سلام مجدد! به PIXEELL خوش آمدید. لطفاً یک گزینه را انتخاب کنید:")
         return ConversationHandler.END
 
-    # --- Start Registration Flow for New or Inactive Users ---
     await update.message.reply_text(
         "👋 سلام! به ربات مدیریت پروژه PIXEELL خوش آمدید.\n\n"
         "برای شروع، لطفاً یکی از پکیج‌های زیر را انتخاب کنید:"
@@ -91,7 +80,7 @@ async def show_packages_for_selection(update: Update, context: ContextTypes.DEFA
         database.get_documents,
         config.APPWRITE_DATABASE_ID,
         config.PACKAGES_COLLECTION_ID,
-        [database.Query.equal("is_active", [True])]
+        [Query.equal("is_active", [True])]
     )
 
     if not packages:
@@ -100,13 +89,13 @@ async def show_packages_for_selection(update: Update, context: ContextTypes.DEFA
 
     keyboard = []
     for pkg in packages:
-        price = "رایگان" if pkg['monthly_price'] == 0 else f"{pkg['monthly_price']:,} تومان/ماه"
+        price = "رایگان" if pkg['monthly_price'] == 0 else f"{pkg['monthly_price']:,} تومان"
         button_text = f"{pkg['package_name']} - {price}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_pkg_{pkg['$id']}")])
 
     details_text = "📜 *راهنمای پکیج‌ها:*\n\n"
     for pkg in packages:
-        price = "رایگان" if pkg['monthly_price'] == 0 else f"{pkg['monthly_price']:,} تومان/ماه"
+        price = "رایگان" if pkg['monthly_price'] == 0 else f"{pkg['monthly_price']:,} تومان"
         details_text += (f"🔹 *{pkg['package_name']}* ({price})\n"
                          f"{pkg.get('package_description', 'توضیحات ندارد.')}\n\n")
 
@@ -129,19 +118,21 @@ async def package_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data['selected_package_id'] = package_id
     
     if pkg_doc['monthly_price'] == 0:
+        context.user_data['is_free_package'] = True
         await query.message.edit_text(
             "شما پکیج رایگان را انتخاب کردید. برای فعال‌سازی، لطفاً توکن API کلیک‌اپ خود را ارسال کنید."
         )
         return AWAITING_CLICKUP_TOKEN
     else:
+        context.user_data['is_free_package'] = False
         await query.message.edit_text(
             f"شما پکیج *{pkg_doc['package_name']}* را انتخاب کردید.\n\n"
-            "لطفاً پس از واریز، اطلاعات پرداخت (مانند شماره تراکنش یا کد رهگیری) را در قالب یک پیام متنی ارسال کنید."
+            "لطفاً پس از واریز، اطلاعات پرداخت (مانند شماره تراکنش، اسکرین‌شات یا کد رهگیری) را در قالب یک پیام متنی ارسال کنید."
         )
         return AWAITING_PAYMENT_DETAILS
 
 async def payment_details_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Saves payment details and notifies admin."""
+    """Saves payment details and proceeds to ask for ClickUp token."""
     user_id = str(update.effective_user.id)
     package_id = context.user_data.get('selected_package_id')
     receipt_details = update.message.text
@@ -151,10 +142,8 @@ async def payment_details_received(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
 
     payment_data = {
-        'telegram_id': user_id,
-        'package_id': package_id,
-        'receipt_details': receipt_details,
-        'status': 'pending',
+        'telegram_id': user_id, 'package_id': package_id,
+        'receipt_details': receipt_details, 'status': 'pending',
         'request_date': datetime.now(timezone.utc).isoformat()
     }
     await asyncio.to_thread(
@@ -162,18 +151,16 @@ async def payment_details_received(update: Update, context: ContextTypes.DEFAULT
     )
 
     await update.message.reply_text(
-        "✅ اطلاعات پرداخت شما با موفقیت ثبت شد.\n\n"
-        "درخواست شما پس از بررسی توسط ادمین فعال خواهد شد. از شکیبایی شما متشکریم."
+        "✅ اطلاعات پرداخت شما ثبت شد و در انتظار تایید ادمین است.\n\n"
+        "برای استفاده از امکانات پایه تا زمان تایید، لطفاً توکن API کلیک‌اپ خود را ارسال کنید."
     )
-    context.user_data.clear()
-    return ConversationHandler.END
+    return AWAITING_CLICKUP_TOKEN
 
 async def clickup_token_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Validates the ClickUp token and finalizes registration."""
     token = update.message.text.strip()
     user_id = str(update.effective_user.id)
-    package_id = context.user_data.get('selected_package_id')
-
+    
     placeholder_message = await update.message.reply_text("در حال اعتبارسنجی توکن...")
     is_valid = await asyncio.to_thread(clickup_api.validate_token, token)
 
@@ -181,24 +168,39 @@ async def clickup_token_received(update: Update, context: ContextTypes.DEFAULT_T
         await placeholder_message.edit_text("❌ توکن نامعتبر است. لطفاً دوباره ارسال کنید یا با /cancel لغو کنید.")
         return AWAITING_CLICKUP_TOKEN
 
-    user_update_data = {'clickup_token': token}
-    if package_id:
-        pkg_doc = await asyncio.to_thread(database.get_single_document_by_id, config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, package_id)
-        if pkg_doc:
-            user_update_data.update({
-                'package_id': package_id,
-                'is_active': True,
-                'usage_limit': pkg_doc.get('ai_call_limit', 0),
-                'used_count': 0,
-                'package_activation_date': datetime.now(timezone.utc).isoformat(),
-                'expiry_date': (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-            })
-
     await asyncio.to_thread(
         database.upsert_document,
         config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID,
-        'telegram_id', user_id, user_update_data
+        'telegram_id', user_id, {'clickup_token': token}
     )
+    
+    # Activate free package immediately, or give pending users the free package temporarily
+    package_to_activate_id = None
+    if context.user_data.get('is_free_package'):
+        package_to_activate_id = context.user_data.get('selected_package_id')
+    else: # It's a pending paid user, give them free access for now
+        free_packages = await asyncio.to_thread(
+            database.get_documents, config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID,
+            [Query.equal("monthly_price", [0])]
+        )
+        if free_packages:
+            package_to_activate_id = free_packages[0]['$id']
+
+    if package_to_activate_id:
+        pkg_doc = await asyncio.to_thread(database.get_single_document_by_id, config.APPWRITE_DATABASE_ID, config.PACKAGES_COLLECTION_ID, package_to_activate_id)
+        if pkg_doc:
+            expiry_date = datetime.now(timezone.utc) + timedelta(days=pkg_doc.get('package_duration_days', 30))
+            user_update_data = {
+                'package_id': package_to_activate_id,
+                'is_active': True,
+                'package_activation_date': datetime.now(timezone.utc).isoformat(),
+                'package_expiry_date': expiry_date.isoformat()
+            }
+            await asyncio.to_thread(
+                database.upsert_document,
+                config.APPWRITE_DATABASE_ID, config.BOT_USERS_COLLECTION_ID,
+                'telegram_id', user_id, user_update_data
+            )
     
     await placeholder_message.edit_text("توکن شما با موفقیت ذخیره شد. در حال همگام‌سازی اولیه اطلاعات... ⏳")
     sync_success = await asyncio.to_thread(clickup_api.sync_all_user_data, token, user_id)
@@ -208,7 +210,7 @@ async def clickup_token_received(update: Update, context: ContextTypes.DEFAULT_T
     else:
         await placeholder_message.edit_text("✅ همگام‌سازی با موفقیت انجام شد!")
 
-    await show_main_menu(update, "ثبت نام شما تکمیل شد. حالا می‌توانید از تمام امکانات ربات استفاده کنید:")
+    await show_main_menu(update, "ثبت نام شما تکمیل شد. حالا می‌توانید از امکانات ربات استفاده کنید:")
     context.user_data.clear()
     return ConversationHandler.END
 
