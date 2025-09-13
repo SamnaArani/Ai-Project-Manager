@@ -11,7 +11,7 @@ from telegram.ext import (
     TypeHandler,
 )
 from telegram import Update
-from telegram.error import Forbidden, BadRequest, TimedOut
+from telegram.error import TimedOut
 
 import config
 from handlers import (
@@ -24,6 +24,7 @@ from handlers import (
     admin_payment_handler,
     admin_user_handler,
     support_handler,
+    profile_handler,
 )
 from webhook_server import run_webhook_server
 import database
@@ -129,15 +130,18 @@ async def run_bot() -> None:
     application.add_handler(CommandHandler("resync", admin_handler.resync_command), group=0)
     application.add_handler(MessageHandler(filters.Regex('^🔍 مرور پروژه‌ها$'), browse_handler.browse_projects_entry), group=0)
     application.add_handler(MessageHandler(filters.Regex('^📞 پشتیبانی$'), support_handler.support_entry), group=0)
+    application.add_handler(MessageHandler(filters.Regex('^👤 پروفایل من$'), profile_handler.profile_entry), group=0)
+
+    # --- Admin Panel Handlers ---
     application.add_handler(MessageHandler(filters.Regex('^📊 مدیریت کاربران$'), admin_user_handler.manage_users_entry), group=0)
     application.add_handler(MessageHandler(filters.Regex('^📦 مدیریت پکیج‌ها$'), admin_package_handler.manage_packages_entry), group=0)
     application.add_handler(MessageHandler(filters.Regex('^💳 بررسی پرداخت‌ها$'), admin_payment_handler.manage_payments_entry), group=0)
     application.add_handler(MessageHandler(filters.Regex(r'^✉️ پیام‌ها'), admin_handler.admin_panel_entry), group=0)
     application.add_handler(MessageHandler(filters.Regex('^📈 گزارشات$'), admin_handler.admin_panel_entry), group=0)
 
-    # گروه 1: مکالمات (اولویت با پشتیبانی است تا با ثبت نام تداخل نکند)
-    application.add_handler(support_handler.get_user_support_conv_handler(), group=1)
+    # گروه 1: مکالمات 
     application.add_handler(auth_handler.get_auth_handler(), group=1)
+    application.add_handler(support_handler.get_user_support_conv_handler(), group=1)
     application.add_handler(task_handler.get_create_task_conv_handler(), group=1)
     application.add_handler(task_handler.get_edit_task_conv_handler(), group=1)
     application.add_handler(admin_package_handler.get_new_package_conv_handler(), group=1)
@@ -146,8 +150,12 @@ async def run_bot() -> None:
     application.add_handler(admin_user_handler.get_send_direct_message_conv_handler(), group=1)
     application.add_handler(admin_payment_handler.get_payment_review_conv_handler(), group=1)
 
-    # گروه 2: هندلرهای مربوط به کلیک روی دکمه‌های شیشه‌ای
+    # گروه 2: هندلرهای مربوط به کلیک روی دکمه‌های شیشه‌ای (عمومی)
     application.add_handler(CallbackQueryHandler(browse_handler.button_handler, pattern='^(browse|view|refresh|delete|confirm)_'), group=2)
+    application.add_handler(CallbackQueryHandler(ai_handlers.handle_ai_delete_confirmation, pattern=r'^(confirm_delete_ai_|cancel_delete_ai$)'), group=2)
+    # --- BUG FIX: Add the new handler for AI corrections ---
+    application.add_handler(CallbackQueryHandler(ai_handlers.handle_ai_correction_callback, pattern=r'^ai_correct_'), group=2)
+    
     application.add_handler(CallbackQueryHandler(admin_package_handler.admin_package_button_handler, pattern=r'^admin_pkg_'), group=2)
     application.add_handler(CallbackQueryHandler(admin_payment_handler.admin_payment_button_handler, pattern=r'^admin_payment_'), group=2)
     application.add_handler(CallbackQueryHandler(admin_user_handler.admin_user_button_handler, pattern=r'^admin_user_(page|view|toggle|delete|confirm|back)_'), group=2)
@@ -155,12 +163,13 @@ async def run_bot() -> None:
 
     # گروه 3: هوش مصنوعی (آخرین اولویت)
     menu_button_texts = [
-        '^🔍 مرور پروژه‌ها$', '^📞 پشتیبانی$', '^📊 مدیریت کاربران$',
+        '^🔍 مرور پروژه‌ها$', '^📞 پشتیبانی$', '^👤 پروفایل من$', '^📊 مدیریت کاربران$',
         '^📦 مدیریت پکیج‌ها$', r'^✉️ پیام‌ها', '^📈 گزارشات$',
         '^➕ ساخت تسک جدید$', '^💳 بررسی پرداخت‌ها$',
     ]
     menu_filters = filters.Regex('|'.join(menu_button_texts))
     ai_text_filter = filters.TEXT & ~filters.COMMAND & ~menu_filters
+    
     application.add_handler(MessageHandler(ai_text_filter, ai_handlers.ai_handler_entry), group=3)
 
     application.add_error_handler(error_handler)
