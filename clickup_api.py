@@ -10,7 +10,11 @@ logger = logging.getLogger(__name__)
 
 def _make_request(url: str, token: str, method: str = 'GET', **kwargs) -> dict | None:
     """یک تابع کمکی برای ارسال درخواست به API کلیک‌اپ و مدیریت خطاها."""
-    headers = {'Authorization': token, 'Content-Type': 'application/json'}
+    # BUG FIX: Encode token to handle non-latin characters like emojis
+    headers = {
+        'Authorization': token.encode('utf-8'),
+        'Content-Type': 'application/json'
+    }
     try:
         response = requests.request(method, url, headers=headers, timeout=15, **kwargs)
         response.raise_for_status()
@@ -221,4 +225,3 @@ def sync_all_user_data(token: str, telegram_id: str) -> bool:
 
     logger.info(f"همگام‌سازی ساختار ClickUp برای کاربر {telegram_id} با موفقیت به پایان رسید.")
     return True
-
