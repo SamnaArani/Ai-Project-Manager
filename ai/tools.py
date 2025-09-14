@@ -68,22 +68,32 @@ def _find_task_in_db(task_name: str, list_name: str, user_id: str) -> Optional[T
         all_list_names = ", ".join(list_choices.keys())
         raise ValueError(f"نام لیست مشخص نشده است. لیست‌های موجود شما: {all_list_names}")
 
-    clean_list_name_input = _clean_text(list_name).lower()
-    best_list_match = None
+    # Create a mapping from cleaned names to original names to handle any whitespace/case issues robustly
+    cleaned_to_original_map = {_clean_text(name).lower(): name for name in list_choices.keys()}
+    cleaned_list_choices = list(cleaned_to_original_map.keys())
     
-    for name in list_choices.keys():
-        if _clean_text(name).lower() == clean_list_name_input:
-            best_list_match = name
-            break
+    cleaned_list_name_input = _clean_text(list_name).lower()
     
-    if not best_list_match:
-        match_result = fuzz_process.extractOne(list_name, list_choices.keys())
-        if match_result and match_result[1] >= 80:
-            best_list_match = match_result[0]
-        else:
-            all_list_names = ", ".join(list_choices.keys())
-            raise ValueError(f"لیست '{list_name}' یافت نشد. لیست‌های موجود شما: {all_list_names}")
+    best_list_match_original_name = None
 
+    # 1. First, try for an exact match on the cleaned name
+    if cleaned_list_name_input in cleaned_to_original_map:
+        best_list_match_original_name = cleaned_to_original_map[cleaned_list_name_input]
+    
+    # 2. If no exact match, use fuzzy matching on the CLEANED names for consistency
+    if not best_list_match_original_name:
+        # We match against cleaned keys, but get back the cleaned key
+        match_result = fuzz_process.extractOne(cleaned_list_name_input, cleaned_list_choices)
+        if match_result and match_result[1] >= 85: # Use a slightly higher threshold
+            # Use the matched cleaned key to get the original key
+            matched_cleaned_key = match_result[0]
+            best_list_match_original_name = cleaned_to_original_map[matched_cleaned_key]
+
+    if not best_list_match_original_name:
+        all_list_names = ", ".join(list_choices.keys())
+        raise ValueError(f"لیست '{list_name}' یافت نشد. لیست‌های موجود شما: {all_list_names}")
+
+    best_list_match = best_list_match_original_name
     list_id = list_choices[best_list_match]
     task_query = user_query + [Query.equal("list_id", [list_id])]
     tasks_in_list = database.get_documents(config.APPWRITE_DATABASE_ID, config.TASKS_COLLECTION_ID, task_query)
@@ -91,25 +101,36 @@ def _find_task_in_db(task_name: str, list_name: str, user_id: str) -> Optional[T
     if not tasks_in_list:
         raise ValueError(f"هیچ تسکی در لیست '{best_list_match}' یافت نشد.")
 
-    task_titles = {task['title']: task for task in tasks_in_list if task.get('title')}
-    
+    # Create a mapping of cleaned titles to original task objects for exact matching
+    task_map = {_clean_text(task['title']).lower(): task for task in tasks_in_list if task.get('title')}
     clean_task_name_input = _clean_text(task_name).lower()
-    best_task_match_title = None
 
-    for title in task_titles.keys():
-        if _clean_text(title).lower() == clean_task_name_input:
-            best_task_match_title = title
-            break
+    # 1. Exact match (case-insensitive, cleaned)
+    if clean_task_name_input in task_map:
+        return task_map[clean_task_name_input], best_list_match
             
-    if not best_task_match_title:
-        match_result = fuzz_process.extractOne(task_name, task_titles.keys())
-        if match_result and match_result[1] > 80:
-            best_task_match_title = match_result[0]
-        else:
-            suggestion = f" آیا منظورتان '{match_result[0]}' بود؟" if match_result else ""
-            raise ValueError(f"تسک با نام نزدیک به '{task_name}' در لیست '{best_list_match}' یافت نشد.{suggestion}")
+    # 2. Fuzzy match if no exact match is found
+    original_titles = [task['title'] for task in tasks_in_list if task.get('title')]
+    match_result = fuzz_process.extractOne(task_name, original_titles)
 
-    return task_titles[best_task_match_title], best_list_match
+    if match_result:
+        best_match_title, score = match_result
+        
+        # Increase threshold to 90 for higher confidence. Only auto-select if very sure.
+        if score >= 90:
+            logger.info(f"Fuzzy match accepted for '{task_name}' -> '{best_match_title}' with score {score}.")
+            # Find the original task object corresponding to the matched title
+            for task in tasks_in_list:
+                if task.get('title') == best_match_title:
+                    return task, best_list_match
+        
+        # For any other match, raise a ValueError to trigger the interactive correction.
+        # This prevents the bot from making a wrong decision on a medium-confidence match.
+        suggestion = f" آیا منظورتان «{best_match_title}» بود؟"
+        raise ValueError(f"تسک «{task_name}» در لیست «{best_list_match}» یافت نشد.{suggestion}")
+
+    # 3. No matches at all
+    raise ValueError(f"هیچ تسکی با نام نزدیک به «{task_name}» در لیست «{best_list_match}» یافت نشد.")
 
 
 async def _handle_find_task_error(
