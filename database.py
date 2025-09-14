@@ -94,8 +94,10 @@ async def setup_database_schemas():
                 ("telegram_id", 'string', 128, True), ("clickup_task_id", 'string', 128, True),
                 ("title", 'string', 512, True), ("status", 'string', 128, False),
                 ("list_id", 'string', 128, True), ("priority", 'string', 128, False),
-                ("content", 'string', 10000, False, ""), ("start_date", 'integer', None, False),
-                ("due_date", 'integer', None, False), ("assignee_name", 'string', 255, False),
+                ("content", 'string', 10000, False, ""), 
+                ("start_date", 'datetime', None, False), # FIX: Changed from integer to datetime
+                ("due_date", 'datetime', None, False),   # FIX: Changed from integer to datetime
+                ("assignee_name", 'string', 255, False),
             ]
         },
         config.PACKAGES_COLLECTION_ID: {
@@ -225,4 +227,3 @@ def delete_document_by_clickup_id(database_id, collection_id, clickup_id_key, cl
     if doc:
         return delete_document(database_id, collection_id, doc['$id'])
     return False
-
